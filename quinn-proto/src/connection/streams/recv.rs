@@ -6,6 +6,7 @@ use tracing::debug;
 
 use super::state::get_or_insert_recv;
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
+use crate::config::WindowUpdatePolicy;
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
 use crate::{TransportError, VarInt, frame};
@@ -16,26 +17,36 @@ pub(super) struct Recv {
     state: RecvState,
     pub(super) assembler: Assembler,
     sent_max_stream_data: u64,
+    window_update_policy: WindowUpdatePolicy,
     pub(super) end: u64,
     pub(super) stopped: bool,
 }
 
 impl Recv {
-    pub(super) fn new(initial_max_data: u64) -> Box<Self> {
+    pub(super) fn new(
+        initial_max_data: u64,
+        window_update_policy: WindowUpdatePolicy,
+    ) -> Box<Self> {
         Box::new(Self {
             state: RecvState::default(),
             assembler: Assembler::new(),
             sent_max_stream_data: initial_max_data,
+            window_update_policy,
             end: 0,
             stopped: false,
         })
     }
 
     /// Reset to the initial state
-    pub(super) fn reinit(&mut self, initial_max_data: u64) {
+    pub(super) fn reinit(
+        &mut self,
+        initial_max_data: u64,
+        window_update_policy: WindowUpdatePolicy,
+    ) {
         self.state = RecvState::default();
         self.assembler.reinit();
         self.sent_max_stream_data = initial_max_data;
+        self.window_update_policy = window_update_policy;
         self.end = 0;
         self.stopped = false;
     }
@@ -110,15 +121,9 @@ impl Recv {
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
         let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
 
-        // Only announce a window update if it's significant enough
-        // to make it worthwhile sending a MAX_STREAM_DATA frame.
-        // We use here a fraction of the configured stream receive window to make
-        // the decision, and accommodate for streams using bigger windows requiring
-        // less updates. A fixed size would also work - but it would need to be
-        // smaller than `stream_receive_window` in order to make sure the stream
-        // does not get stuck.
         let diff = max_stream_data - self.sent_max_stream_data;
-        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
+        let threshold = self.window_update_policy.apply(stream_receive_window);
+        let transmit = self.can_send_flow_control() && diff >= threshold;
         (max_stream_data, ShouldTransmit(transmit))
     }
 
@@ -263,11 +268,18 @@ impl<'a> Chunks<'a> {
             Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
-        let mut recv =
-            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::ClosedStream),
-                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
-            };
+        let mut recv = match get_or_insert_recv(
+            streams.stream_receive_window,
+            streams
+                .flow_control_config
+                .stream_receive_window_update
+                .clone(),
+        )(entry.get_mut())
+        .stopped
+        {
+            true => return Err(ReadableError::ClosedStream),
+            false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+        };
 
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
@@ -443,7 +455,9 @@ impl Default for RecvState {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::num::NonZeroU64;
 
+    use crate::config::WindowUpdatePolicy;
     use crate::{Dir, Side};
 
     use super::*;
@@ -453,7 +467,7 @@ mod tests {
         const INITIAL_BYTES: u64 = 3;
         const INITIAL_OFFSET: u64 = 3;
         const RECV_WINDOW: u64 = 8;
-        let mut s = Recv::new(RECV_WINDOW);
+        let mut s = Recv::new(RECV_WINDOW, WindowUpdatePolicy::default());
         let mut data_recvd = 0;
         // Receive bytes 3..6
         let (new_bytes, is_closed) = s
@@ -539,5 +553,21 @@ mod tests {
             max_stream_data, RECV_WINDOW,
             "stream flow control credit isn't issued after stop"
         );
+    }
+
+    #[test]
+    fn max_stream_data_uses_policy_threshold() {
+        // Diff between sent and current window is 500; with a 700-byte absolute threshold
+        // we should suppress the update.
+        let mut s = Recv::new(500, WindowUpdatePolicy::Absolute(700));
+
+        let (max_stream_data, transmit) = s.max_stream_data(1000);
+        assert_eq!(max_stream_data, 1000);
+        assert!(!transmit.should_transmit());
+
+        // A looser policy should allow an update for the same diff.
+        s.window_update_policy = WindowUpdatePolicy::Ratio(NonZeroU64::new(2).unwrap());
+        let (_, transmit) = s.max_stream_data(1000);
+        assert!(transmit.should_transmit());
     }
 }

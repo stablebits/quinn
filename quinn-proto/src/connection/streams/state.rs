@@ -15,6 +15,7 @@ use super::{
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
+    config::{FlowControlConfig, WindowUpdatePolicy},
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
@@ -54,11 +55,15 @@ impl StreamRecv {
     }
 
     // Reinitialize the stream so the inner `Recv` can be reused
-    pub(super) fn free(self, initial_max_data: u64) -> Self {
+    pub(super) fn free(
+        self,
+        initial_max_data: u64,
+        window_update_policy: WindowUpdatePolicy,
+    ) -> Self {
         match self {
             Self::Free(_) => unreachable!("Self::Free on reinit()"),
             Self::Open(mut recv) => {
-                recv.reinit(initial_max_data);
+                recv.reinit(initial_max_data, window_update_policy);
                 Self::Free(recv)
             }
         }
@@ -137,6 +142,8 @@ pub struct StreamsState {
 
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
+
+    pub(super) flow_control_config: FlowControlConfig,
 }
 
 impl StreamsState {
@@ -148,6 +155,7 @@ impl StreamsState {
         send_window: u64,
         receive_window: VarInt,
         stream_receive_window: VarInt,
+        flow_control_config: FlowControlConfig,
     ) -> Self {
         let mut this = Self {
             side,
@@ -181,6 +189,7 @@ impl StreamsState {
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
+            flow_control_config,
         };
 
         for dir in Dir::iter() {
@@ -260,11 +269,10 @@ impl StreamsState {
             debug!("received illegal STREAM frame");
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.flow_control_config.stream_receive_window_update,
+        )) {
             Some(rs) => rs,
             None => {
                 trace!("dropping frame for closed stream");
@@ -313,11 +321,10 @@ impl StreamsState {
             debug!("received illegal RESET_STREAM frame");
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.flow_control_config.stream_receive_window_update,
+        )) {
             Some(stream) => stream,
             None => {
                 trace!("received RESET_STREAM on closed stream");
@@ -809,9 +816,12 @@ impl StreamsState {
         let mut queued = false;
         for dir in Dir::iter() {
             let diff = self.max_remote[dir as usize] - self.sent_max_remote[dir as usize];
-            // To reduce traffic, only announce updates if at least 1/8 of the flow control window
-            // has been consumed.
-            if diff > self.max_concurrent_remote_count[dir as usize] / 8 {
+            // Updates can be delayed/aggregated to reduce traffic.
+            let update_policy = match dir {
+                Dir::Uni => &self.flow_control_config.max_uni_streams_update,
+                Dir::Bi => &self.flow_control_config.max_bidi_streams_update,
+            };
+            if diff > update_policy.apply(self.max_concurrent_remote_count[dir as usize]) {
                 pending.max_stream_id[dir as usize] = true;
                 queued = true;
             }
@@ -917,11 +927,13 @@ impl StreamsState {
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_DATA frame.
-        // We use a fraction of the configured connection receive window to make
-        // the decision, to accommodate for connection using bigger windows requiring
-        // less updates.
         let diff = self.local_max_data - self.sent_max_data.into_inner();
-        ShouldTransmit(diff >= (self.receive_window / 8))
+        ShouldTransmit(
+            diff >= self
+                .flow_control_config
+                .receive_window_update
+                .apply(self.receive_window),
+        )
     }
 
     /// Update counters for removal of a stream
@@ -943,7 +955,10 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.free_recv.push(recv.free(
+            self.stream_receive_window,
+            self.flow_control_config.stream_receive_window_update,
+        ));
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -969,15 +984,18 @@ pub(super) fn get_or_insert_send(
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
+    window_update_policy: WindowUpdatePolicy,
 ) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
     move |opt| {
         *opt = opt.take().map(|s| match s {
             StreamRecv::Free(recv) => StreamRecv::Open(recv),
             s => s,
         });
-        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
-            .as_open_recv_mut()
-            .unwrap()
+        opt.get_or_insert_with(|| {
+            StreamRecv::Open(Recv::new(initial_max_data, window_update_policy))
+        })
+        .as_open_recv_mut()
+        .unwrap()
     }
 }
 
@@ -998,6 +1016,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            FlowControlConfig::default(),
         )
     }
 
@@ -1010,6 +1029,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            FlowControlConfig::default(),
         );
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;

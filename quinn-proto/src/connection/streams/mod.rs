@@ -138,7 +138,10 @@ impl RecvStream<'_> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(
+            self.state.stream_receive_window,
+            self.state.flow_control_config.stream_receive_window_update,
+        )(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {

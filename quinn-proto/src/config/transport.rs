@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, num::NonZeroU64, sync::Arc};
 #[cfg(feature = "qlog")]
 use std::{io, sync::Mutex, time::Instant};
 
@@ -32,6 +32,7 @@ pub struct TransportConfig {
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
+    pub(crate) flow_control_config: FlowControlConfig,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -150,6 +151,14 @@ impl TransportConfig {
     /// many small streams.
     pub fn send_fairness(&mut self, value: bool) -> &mut Self {
         self.send_fairness = value;
+        self
+    }
+
+    /// Specifies the Flow Control config (see [`FlowControlConfig`] for details)
+    ///
+    /// Enabled by default.
+    pub fn flow_control_config(&mut self, value: FlowControlConfig) -> &mut Self {
+        self.flow_control_config = value;
         self
     }
 
@@ -367,6 +376,7 @@ impl Default for TransportConfig {
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
+            flow_control_config: FlowControlConfig::default(),
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -405,6 +415,7 @@ impl fmt::Debug for TransportConfig {
             receive_window,
             send_window,
             send_fairness,
+            flow_control_config,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -434,6 +445,7 @@ impl fmt::Debug for TransportConfig {
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
+            .field("flow_control_config", flow_control_config)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
@@ -535,6 +547,81 @@ impl Default for AckFrequencyConfig {
             ack_eliciting_threshold: VarInt(1),
             max_ack_delay: None,
             reordering_threshold: VarInt(2),
+        }
+    }
+}
+
+/// How aggressively to emit flow control window updates.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WindowUpdatePolicy {
+    /// Emit an update once the window has shrunk below `window / ratio`.
+    Ratio(NonZeroU64),
+    /// Emit an update once the window has shrunk below this absolute threshold.
+    Absolute(u64),
+}
+
+impl WindowUpdatePolicy {
+    /// Returns the minimum window delta that should trigger an update.
+    pub fn apply(&self, window: u64) -> u64 {
+        match *self {
+            WindowUpdatePolicy::Ratio(r) => window / r.get(),
+            WindowUpdatePolicy::Absolute(v) => v.min(window),
+        }
+    }
+}
+
+impl Default for WindowUpdatePolicy {
+    fn default() -> Self {
+        Self::Ratio(NonZeroU64::new(8).unwrap())
+    }
+}
+
+/// Configuration for flow control window update thresholds.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct FlowControlConfig {
+    /// When to issue MAX_STREAMS for bidirectional streams.
+    pub(crate) max_bidi_streams_update: WindowUpdatePolicy,
+    /// When to issue MAX_STREAMS for unidirectional streams.
+    pub(crate) max_uni_streams_update: WindowUpdatePolicy,
+    /// When to issue MAX_DATA.
+    pub(crate) receive_window_update: WindowUpdatePolicy,
+    /// When to issue MAX_STREAM_DATA.
+    pub(crate) stream_receive_window_update: WindowUpdatePolicy,
+}
+
+impl FlowControlConfig {
+    /// Set the MAX_STREAMS update policy for bidirectional streams.
+    pub fn max_bidi_streams_update(&mut self, value: WindowUpdatePolicy) -> &mut Self {
+        self.max_bidi_streams_update = value;
+        self
+    }
+
+    /// Set the MAX_STREAMS update policy for unidirectional streams.
+    pub fn max_uni_streams_update(&mut self, value: WindowUpdatePolicy) -> &mut Self {
+        self.max_uni_streams_update = value;
+        self
+    }
+
+    /// Set the MAX_DATA update policy.
+    pub fn receive_window_update(&mut self, value: WindowUpdatePolicy) -> &mut Self {
+        self.receive_window_update = value;
+        self
+    }
+
+    /// Set the MAX_STREAM_DATA update policy.
+    pub fn stream_receive_window_update(&mut self, value: WindowUpdatePolicy) -> &mut Self {
+        self.stream_receive_window_update = value;
+        self
+    }
+}
+
+impl Default for FlowControlConfig {
+    fn default() -> Self {
+        Self {
+            max_bidi_streams_update: WindowUpdatePolicy::Ratio(NonZeroU64::new(8).unwrap()),
+            max_uni_streams_update: WindowUpdatePolicy::Ratio(NonZeroU64::new(8).unwrap()),
+            receive_window_update: WindowUpdatePolicy::Ratio(NonZeroU64::new(8).unwrap()),
+            stream_receive_window_update: WindowUpdatePolicy::Ratio(NonZeroU64::new(8).unwrap()),
         }
     }
 }
