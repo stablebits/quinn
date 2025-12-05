@@ -270,10 +270,7 @@ impl<'a> Chunks<'a> {
 
         let mut recv = match get_or_insert_recv(
             streams.stream_receive_window,
-            streams
-                .flow_control_config
-                .stream_receive_window_update
-                .clone(),
+            streams.flow_control_config.stream_receive_window_update,
         )(entry.get_mut())
         .stopped
         {
@@ -557,17 +554,21 @@ mod tests {
 
     #[test]
     fn max_stream_data_uses_policy_threshold() {
-        // Diff between sent and current window is 500; with a 700-byte absolute threshold
-        // we should suppress the update.
-        let mut s = Recv::new(500, WindowUpdatePolicy::Absolute(700));
+        let mut s = Recv::new(500, WindowUpdatePolicy::Absolute(200));
 
-        let (max_stream_data, transmit) = s.max_stream_data(1000);
-        assert_eq!(max_stream_data, 1000);
+        let (max_stream_data, transmit) = s.max_stream_data(650);
+        assert_eq!(max_stream_data, 650);
         assert!(!transmit.should_transmit());
 
-        // A looser policy should allow an update for the same diff.
+        let (max_stream_data, transmit) = s.max_stream_data(700);
+        assert_eq!(max_stream_data, 700);
+        assert!(transmit.should_transmit());
+
         s.window_update_policy = WindowUpdatePolicy::Ratio(NonZeroU64::new(2).unwrap());
-        let (_, transmit) = s.max_stream_data(1000);
+        let (_, transmit) = s.max_stream_data(900);
+        assert!(!transmit.should_transmit());
+
+        let (_, transmit) = s.max_stream_data(1100);
         assert!(transmit.should_transmit());
     }
 }
