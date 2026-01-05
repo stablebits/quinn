@@ -19,7 +19,7 @@ use tracing::{Instrument, Span, debug_span};
 use crate::{
     ConnectionEvent, Duration, Instant, VarInt,
     mutex::Mutex,
-    recv_stream::RecvStream,
+    recv_stream::{ReadToEndError, RecvStream},
     runtime::{AsyncTimer, Runtime, UdpSender},
     send_stream::SendStream,
     udp_transmit,
@@ -330,6 +330,18 @@ impl Connection {
             conn: &self.0,
             notify: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
         }
+    }
+
+    /// Accept the next uni-directional stream and read it to completion in one step
+    pub async fn accept_uni_and_read_to_end(
+        &self,
+        size_limit: usize,
+    ) -> Result<Vec<u8>, AcceptUniReadToEndError> {
+        let mut stream = self.accept_uni().await?;
+        stream
+            .read_to_end(size_limit)
+            .await
+            .map_err(AcceptUniReadToEndError::from)
     }
 
     /// Accept the next incoming bidirectional stream
@@ -772,6 +784,17 @@ impl Future for AcceptUni<'_> {
         let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Uni))?;
         Poll::Ready(Ok(RecvStream::new(conn, id, is_0rtt)))
     }
+}
+
+/// Errors from [`Connection::accept_uni_and_read_to_end`]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AcceptUniReadToEndError {
+    /// Accepting the stream failed
+    #[error("accept error: {0}")]
+    Connection(#[from] ConnectionError),
+    /// Reading the stream failed
+    #[error("read error: {0}")]
+    Read(#[from] ReadToEndError),
 }
 
 pin_project! {

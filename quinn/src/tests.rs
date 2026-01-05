@@ -165,6 +165,102 @@ fn read_after_close() {
     });
 }
 
+#[tokio::test]
+async fn accept_uni_and_read_to_end_prefers_completed_streams() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    const FAST: &[u8] = b"fast";
+    const SLOW_PART1: &[u8] = b"slow-";
+    const SLOW_PART2: &[u8] = b"stream";
+
+    let sender = async move {
+        let mut slow = server.open_uni().await.unwrap();
+        slow.write_all(SLOW_PART1).await.unwrap();
+
+        let mut fast = server.open_uni().await.unwrap();
+        fast.write_all(FAST).await.unwrap();
+        fast.finish().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        slow.write_all(SLOW_PART2).await.unwrap();
+        slow.finish().unwrap();
+        _ = fast.stopped().await;
+        _ = slow.stopped().await;
+    };
+
+    let receiver = async move {
+        let first = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_uni_and_read_to_end(usize::MAX),
+        )
+        .await
+        .expect("timeout waiting for first stream")
+        .expect("first stream");
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_uni_and_read_to_end(usize::MAX),
+        )
+        .await
+        .expect("timeout waiting for second stream")
+        .expect("second stream");
+
+        assert_eq!(first, FAST);
+        let mut expected_slow = Vec::new();
+        expected_slow.extend_from_slice(SLOW_PART1);
+        expected_slow.extend_from_slice(SLOW_PART2);
+        assert_eq!(second, expected_slow);
+    };
+
+    tokio::join!(sender, receiver);
+}
+
+#[tokio::test]
+async fn accept_uni_and_read_to_end_respects_size_limit() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    let sender = async move {
+        let mut stream = server.open_uni().await.unwrap();
+        stream.write_all(&vec![42u8; 32]).await.unwrap();
+        stream.finish().unwrap();
+        _ = stream.stopped().await;
+    };
+
+    let receiver = async move {
+        let err =
+            tokio::time::timeout(Duration::from_secs(1), client.accept_uni_and_read_to_end(8))
+                .await
+                .expect("timeout waiting for stream")
+                .expect_err("stream should have been rejected for exceeding the size limit");
+
+        assert!(matches!(
+            err,
+            crate::AcceptUniReadToEndError::Read(crate::ReadToEndError::TooLong)
+        ));
+    };
+
+    tokio::join!(sender, receiver);
+}
+
 #[test]
 fn export_keying_material() {
     let _guard = subscribe();
