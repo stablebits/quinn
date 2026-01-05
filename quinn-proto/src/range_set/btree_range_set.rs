@@ -82,7 +82,7 @@ impl RangeSet {
     }
 
     /// Find closest range to `x` that begins at or before it
-    fn pred(&self, x: u64) -> Option<(u64, u64)> {
+    pub(crate) fn pred(&self, x: u64) -> Option<(u64, u64)> {
         self.0
             .range((Included(0), Included(x)))
             .next_back()

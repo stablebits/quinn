@@ -213,6 +213,42 @@ impl Assembler {
         self.bytes_read
     }
 
+    /// Check if all data up to `limit` is available.
+    /// Worst-case O(n^2); intended for short limits (~4 KiB), while avoiding extra allocations or
+    /// code complexity in the hot path.
+    pub(super) fn is_all_data_available(&self, limit: u64) -> bool {
+        if self.bytes_read >= limit {
+            return true;
+        }
+
+        match self.state {
+            State::Ordered => {
+                let mut current = self.bytes_read;
+                while current < limit {
+                    // Find the chunk that extends the furthest beyond `current`
+                    // among those that start at or before `current`.
+                    let mut best_end = current;
+                    for buffer in self.data.iter() {
+                        let end = buffer.offset + buffer.bytes.len() as u64;
+                        if buffer.offset <= current && end > current {
+                            best_end = std::cmp::max(best_end, end);
+                        }
+                    }
+
+                    if best_end == current {
+                        // No chunk covers the current gap
+                        return false;
+                    }
+                    current = best_end;
+                }
+                true
+            }
+            State::Unordered { ref recvd } => recvd
+                .pred(self.bytes_read)
+                .map_or(false, |(_, end)| end >= limit),
+        }
+    }
+
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         self.data.clear();
@@ -646,6 +682,55 @@ mod test {
             Some(Chunk::new(0, Bytes::from_static(b"abc")))
         );
         assert_eq!(x.read(3, false), None);
+    }
+
+    #[test]
+    fn all_data_available_ordered() {
+        let mut x = Assembler::new();
+        assert!(!x.is_all_data_available(6));
+        x.insert(4, Bytes::from_static(b"ef"), 2);
+        assert!(!x.is_all_data_available(6));
+        x.insert(0, Bytes::from_static(b"abcd"), 4);
+        assert!(x.is_all_data_available(6));
+    }
+
+    #[test]
+    fn all_data_available_ordered_after_progress() {
+        let mut x = Assembler::new();
+        x.insert(0, Bytes::from_static(b"abcd"), 4);
+        assert!(x.is_all_data_available(4));
+        assert_eq!(
+            x.read(2, true),
+            Some(Chunk::new(0, Bytes::from_static(b"ab")))
+        );
+        assert!(x.is_all_data_available(4));
+        assert!(!x.is_all_data_available(6));
+        x.insert(4, Bytes::from_static(b"ef"), 2);
+        assert!(x.is_all_data_available(6));
+    }
+
+    #[test]
+    fn all_data_available_unordered() {
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        x.insert(0, Bytes::from_static(b"abc"), 3);
+        assert!(!x.is_all_data_available(6));
+        x.insert(3, Bytes::from_static(b"def"), 3);
+        assert!(x.is_all_data_available(6));
+        assert_eq!(
+            x.read(3, false),
+            Some(Chunk::new(0, Bytes::from_static(b"abc")))
+        );
+        assert!(x.is_all_data_available(6));
+    }
+
+    #[test]
+    fn all_data_available_unordered_gap() {
+        let mut x = Assembler::new();
+        x.ensure_ordering(false).unwrap();
+        x.insert(1, Bytes::from_static(b"bc"), 2);
+        x.insert(4, Bytes::from_static(b"ef"), 2);
+        assert!(!x.is_all_data_available(4));
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {
