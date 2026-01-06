@@ -65,6 +65,12 @@ impl StreamRecv {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum AcceptMode {
+    All,
+    Finished,
+}
+
 #[allow(unreachable_pub)] // fuzzing only
 pub struct StreamsState {
     pub(super) side: Side,
@@ -93,8 +99,10 @@ pub struct StreamsState {
     /// Whether the remote endpoint has opened any streams the application doesn't know about yet,
     /// per directionality
     opened: [bool; 2],
+    pub(super) accept_mode: [AcceptMode; 2],
     // Next to report to the application, once opened
     pub(super) next_reported_remote: [u64; 2],
+    pub(super) finished_uni_streams: VecDeque<StreamId>,
     /// Number of outbound streams
     ///
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
@@ -148,6 +156,7 @@ impl StreamsState {
         send_window: u64,
         receive_window: VarInt,
         stream_receive_window: VarInt,
+        accept_uni_finished_only: bool,
     ) -> Self {
         let mut this = Self {
             side,
@@ -163,7 +172,9 @@ impl StreamsState {
             flow_control_adjusted: false,
             next_remote: [0, 0],
             opened: [false, false],
+            accept_mode: [AcceptMode::All, AcceptMode::All],
             next_reported_remote: [0, 0],
+            finished_uni_streams: VecDeque::default(), // FIXME: ok to use with_capacity()?
             send_streams: 0,
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
@@ -182,6 +193,10 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
         };
+
+        if accept_uni_finished_only {
+            this.accept_mode[Dir::Uni as usize] = AcceptMode::Finished;
+        }
 
         for dir in Dir::iter() {
             for i in 0..this.max_remote[dir as usize] {
@@ -281,8 +296,15 @@ impl StreamsState {
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
+        let all_data_available =
+            if matches!(self.accept_mode[id.dir() as usize], AcceptMode::Finished) {
+                rs.is_all_data_available()
+            } else {
+                false
+            };
+
         if !rs.stopped {
-            self.on_stream_frame(true, id);
+            self.on_stream_frame(true, id, all_data_available);
             return Ok(ShouldTransmit(false));
         }
 
@@ -343,7 +365,7 @@ impl StreamsState {
             let rs = self.recv.remove(&id).flatten().unwrap();
             self.stream_recv_freed(id, rs);
         }
-        self.on_stream_frame(!stopped, id);
+        self.on_stream_frame(!stopped, id, true);
 
         // Update connection-level flow control
         Ok(if bytes_read != final_offset.into_inner() {
@@ -373,7 +395,7 @@ impl StreamsState {
         if stream.try_stop(error_code) {
             self.events
                 .push_back(StreamEvent::Stopped { id, error_code });
-            self.on_stream_frame(false, id);
+            self.on_stream_frame(false, id, true);
         }
     }
 
@@ -617,7 +639,12 @@ impl StreamsState {
     }
 
     /// Notify the application that new streams were opened or a stream became readable.
-    fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
+    fn on_stream_frame(
+        &mut self,
+        notify_readable: bool,
+        stream: StreamId,
+        all_data_available: bool,
+    ) {
         if stream.initiator() == self.side {
             // Notifying about the opening of locally-initiated streams would be redundant.
             if notify_readable {
@@ -625,10 +652,25 @@ impl StreamsState {
             }
             return;
         }
+        if stream.dir() == Dir::Uni
+            && matches!(
+                self.accept_mode[Dir::Uni as usize],
+                AcceptMode::Finished
+            )
+            && all_data_available
+        {
+            self.finished_uni_streams.push_back(stream);
+            self.opened[stream.dir() as usize] = true;
+        }
         let next = &mut self.next_remote[stream.dir() as usize];
         if stream.index() >= *next {
             *next = stream.index() + 1;
-            self.opened[stream.dir() as usize] = true;
+            if !matches!(
+                self.accept_mode[stream.dir() as usize],
+                AcceptMode::Finished
+            ) {
+                self.opened[stream.dir() as usize] = true;
+            }
         } else if notify_readable {
             self.events.push_back(StreamEvent::Readable { id: stream });
         }
@@ -763,7 +805,7 @@ impl StreamsState {
             ));
         }
 
-        self.on_stream_frame(false, id);
+        self.on_stream_frame(false, id, false);
         Ok(())
     }
 
@@ -998,6 +1040,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            false,
         )
     }
 
@@ -1010,6 +1053,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            false,
         );
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;

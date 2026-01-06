@@ -163,6 +163,13 @@ impl Recv {
         }
     }
 
+    pub(super) fn is_all_data_available(&self) -> bool {
+        match self.final_offset() {
+            Some(final_offset) => self.assembler.is_all_data_available(final_offset),
+            None => false,
+        }
+    }
+
     /// Returns `false` iff the reset was redundant
     pub(super) fn reset(
         &mut self,

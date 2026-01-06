@@ -32,7 +32,9 @@ pub struct TransportConfig {
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
-
+    /// If true, only enqueue uni streams once all data has been received (for `accept_uni_and_read_to_end`)
+    pub(crate) accept_uni_finished_only: bool,
+    /// TODO: finished_uni_max_size, finished_uni_timeout
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
@@ -348,6 +350,15 @@ impl TransportConfig {
         self.qlog_sink = stream.into();
         self
     }
+
+    /// If enabled, only report incoming uni streams once all data for the stream has been received.
+    ///
+    /// Useful with `accept_uni_and_read_to_end` to ensure the stream can be consumed immediately
+    /// without extra buffering or waiting.
+    pub fn accept_uni_finished_only(&mut self, enabled: bool) -> &mut Self {
+        self.accept_uni_finished_only = enabled;
+        self
+    }
 }
 
 impl Default for TransportConfig {
@@ -367,6 +378,7 @@ impl Default for TransportConfig {
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
+            accept_uni_finished_only: false,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -405,6 +417,7 @@ impl fmt::Debug for TransportConfig {
             receive_window,
             send_window,
             send_fairness,
+            accept_uni_finished_only,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -434,6 +447,7 @@ impl fmt::Debug for TransportConfig {
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
+            .field("accept_uni_finished_only", accept_uni_finished_only)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)

@@ -168,7 +168,9 @@ fn read_after_close() {
 #[tokio::test]
 async fn accept_uni_and_read_to_end_prefers_completed_streams() {
     let _guard = subscribe();
-    let endpoint = endpoint();
+    let mut cfg = TransportConfig::default();
+    cfg.accept_uni_finished_only(true);
+    let endpoint = endpoint_with_config(cfg);
 
     let (client, server) = tokio::join!(
         endpoint
@@ -225,9 +227,88 @@ async fn accept_uni_and_read_to_end_prefers_completed_streams() {
 }
 
 #[tokio::test]
+async fn accept_uni_and_read_chunks_to_end_prefers_completed_streams() {
+    let _guard = subscribe();
+    let mut cfg = TransportConfig::default();
+    cfg.accept_uni_finished_only(true);
+    let endpoint = endpoint_with_config(cfg);
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    const FAST: &[u8] = b"fast";
+    const SLOW_PART1: &[u8] = b"slow-";
+    const SLOW_PART2: &[u8] = b"stream";
+
+    let sender = async move {
+        let mut slow = server.open_uni().await.unwrap();
+        slow.write_all(SLOW_PART1).await.unwrap();
+
+        let mut fast = server.open_uni().await.unwrap();
+        fast.write_all(FAST).await.unwrap();
+        fast.finish().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        slow.write_all(SLOW_PART2).await.unwrap();
+        slow.finish().unwrap();
+        _ = fast.stopped().await;
+        _ = slow.stopped().await;
+    };
+
+    let receiver = async move {
+        let mut bufs = vec![Bytes::new(); 4];
+        let (written_first, complete_first) = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_uni_and_read_chunks_to_end(&mut bufs),
+        )
+        .await
+        .expect("timeout waiting for first stream")
+        .expect("first stream");
+        assert!(complete_first);
+        let first = bufs[..written_first]
+            .iter()
+            .fold(Vec::new(), |mut acc, b| {
+                acc.extend_from_slice(&b[..]);
+                acc
+            });
+
+        let (written_second, complete_second) = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_uni_and_read_chunks_to_end(&mut bufs),
+        )
+        .await
+        .expect("timeout waiting for second stream")
+        .expect("second stream");
+        assert!(complete_second);
+        let second = bufs[..written_second]
+            .iter()
+            .fold(Vec::new(), |mut acc, b| {
+                acc.extend_from_slice(&b[..]);
+                acc
+            });
+
+        assert_eq!(first, FAST);
+        let mut expected_slow = Vec::new();
+        expected_slow.extend_from_slice(SLOW_PART1);
+        expected_slow.extend_from_slice(SLOW_PART2);
+        assert_eq!(second, expected_slow);
+    };
+
+    tokio::join!(sender, receiver);
+}
+
+#[tokio::test]
 async fn accept_uni_and_read_to_end_respects_size_limit() {
     let _guard = subscribe();
-    let endpoint = endpoint();
+    let mut cfg = TransportConfig::default();
+    cfg.accept_uni_finished_only(true);
+    let endpoint = endpoint_with_config(cfg);
 
     let (client, server) = tokio::join!(
         endpoint
