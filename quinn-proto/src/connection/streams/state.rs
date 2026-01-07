@@ -65,12 +65,6 @@ impl StreamRecv {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum AcceptMode {
-    All,
-    Finished,
-}
-
 #[allow(unreachable_pub)] // fuzzing only
 pub struct StreamsState {
     pub(super) side: Side,
@@ -99,9 +93,9 @@ pub struct StreamsState {
     /// Whether the remote endpoint has opened any streams the application doesn't know about yet,
     /// per directionality
     opened: [bool; 2],
-    pub(super) accept_mode: [AcceptMode; 2],
     // Next to report to the application, once opened
     pub(super) next_reported_remote: [u64; 2],
+    pub(super) accept_uni_finished_only: bool,
     pub(super) finished_uni_streams: VecDeque<StreamId>,
     /// Number of outbound streams
     ///
@@ -172,9 +166,9 @@ impl StreamsState {
             flow_control_adjusted: false,
             next_remote: [0, 0],
             opened: [false, false],
-            accept_mode: [AcceptMode::All, AcceptMode::All],
             next_reported_remote: [0, 0],
-            finished_uni_streams: VecDeque::default(), // FIXME: ok to use with_capacity()?
+            accept_uni_finished_only,
+            finished_uni_streams: VecDeque::default(),
             send_streams: 0,
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
@@ -195,7 +189,7 @@ impl StreamsState {
         };
 
         if accept_uni_finished_only {
-            this.accept_mode[Dir::Uni as usize] = AcceptMode::Finished;
+            this.finished_uni_streams.reserve(16);
         }
 
         for dir in Dir::iter() {
@@ -296,12 +290,11 @@ impl StreamsState {
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
-        let all_data_available =
-            if matches!(self.accept_mode[id.dir() as usize], AcceptMode::Finished) {
-                rs.is_all_data_available()
-            } else {
-                false
-            };
+        let all_data_available = if id.dir() == Dir::Uni && self.accept_uni_finished_only {
+            rs.is_all_data_available()
+        } else {
+            false
+        };
 
         if !rs.stopped {
             self.on_stream_frame(true, id, all_data_available);
@@ -652,25 +645,17 @@ impl StreamsState {
             }
             return;
         }
-        if stream.dir() == Dir::Uni
-            && matches!(
-                self.accept_mode[Dir::Uni as usize],
-                AcceptMode::Finished
-            )
-            && all_data_available
-        {
-            self.finished_uni_streams.push_back(stream);
-            self.opened[stream.dir() as usize] = true;
+        if stream.dir() == Dir::Uni && self.accept_uni_finished_only {
+            if all_data_available {
+                self.finished_uni_streams.push_back(stream);
+                self.opened[stream.dir() as usize] = true;
+            }
+            return;
         }
         let next = &mut self.next_remote[stream.dir() as usize];
         if stream.index() >= *next {
             *next = stream.index() + 1;
-            if !matches!(
-                self.accept_mode[stream.dir() as usize],
-                AcceptMode::Finished
-            ) {
-                self.opened[stream.dir() as usize] = true;
-            }
+            self.opened[stream.dir() as usize] = true;
         } else if notify_readable {
             self.events.push_back(StreamEvent::Readable { id: stream });
         }

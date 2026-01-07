@@ -224,28 +224,29 @@ impl Assembler {
         match self.state {
             State::Ordered => {
                 let mut current = self.bytes_read;
-                while current < limit {
-                    // Find the chunk that extends the furthest beyond `current`
-                    // among those that start at or before `current`.
-                    let mut best_end = current;
-                    for buffer in self.data.iter() {
-                        let end = buffer.offset + buffer.bytes.len() as u64;
-                        if buffer.offset <= current && end > current {
-                            best_end = std::cmp::max(best_end, end);
-                        }
-                    }
 
-                    if best_end == current {
-                        // No chunk covers the current gap
-                        return false;
-                    }
-                    current = best_end;
+                // If there is a [start, end) block that includes `cur`, return its `end`.
+                let advance = |cur: u64| -> Option<u64> {
+                    self.data
+                        .iter()
+                        .filter_map(|b| {
+                            let end = b.offset + b.bytes.len() as u64;
+                            (b.offset <= cur && end > cur).then_some(end)
+                        })
+                        .max()
+                };
+
+                while current < limit {
+                    current = match advance(current) {
+                        Some(end) => end,
+                        None => return false,
+                    };
                 }
                 true
             }
             State::Unordered { ref recvd } => recvd
                 .pred(self.bytes_read)
-                .map_or(false, |(_, end)| end >= limit),
+                .is_some_and(|(_, end)| end >= limit),
         }
     }
 

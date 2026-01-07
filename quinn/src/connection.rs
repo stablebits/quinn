@@ -333,17 +333,10 @@ impl Connection {
         }
     }
 
-    /// Accept the next incoming uni-directional stream that is already finished and fully buffered.
-    ///
-    /// Requires `TransportConfig::accept_uni_finished_only(true)`.
-    pub fn accept_uni_finished(&self) -> AcceptUniFinished<'_> {
-        AcceptUniFinished {
-            conn: &self.0,
-            notify: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
-        }
-    }
-
     /// Accept the next uni-directional stream and read it to completion in one step
+    ///
+    /// This expects the connection to be configured with `accept_uni_finished_only(true)` so the
+    /// stream is already finished and fully buffered.
     pub async fn accept_uni_and_read_to_end(
         &self,
         size_limit: usize,
@@ -807,8 +800,7 @@ impl Future for AcceptUni<'_> {
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let (conn, id, is_0rtt) =
-            ready!(poll_accept(ctx, this.conn, this.notify, Dir::Uni, false))?;
+        let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Uni))?;
         Poll::Ready(Ok(RecvStream::new(conn, id, is_0rtt)))
     }
 }
@@ -823,37 +815,16 @@ pin_project! {
     }
 }
 
-pin_project! {
-    /// Future produced by [`Connection::accept_uni`]
-    pub struct AcceptUniFinished<'a> {
-        conn: &'a ConnectionRef,
-        #[pin]
-        notify: Notified<'a>,
-    }
-}
-
-impl Future for AcceptUniFinished<'_> {
-    type Output = Result<RecvStream, ConnectionError>;
-
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Uni, true))?;
-        Poll::Ready(Ok(RecvStream::new(conn, id, is_0rtt)))
-    }
-}
-
 impl Future for AcceptUniAndReadChunks<'_, '_> {
     type Output = Result<(usize, bool), AcceptUniReadChunksError>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         let mut state = this.conn.state.lock("AcceptUniAndReadChunks::poll");
-        if let Some(id) = state.inner.streams().accept_finished(Dir::Uni) {
+        if let Some(id) = state.inner.streams().accept_uni_finished() {
             let res = state.inner.recv_stream(id).read_chunks_to_end(this.out);
             match res {
-                Ok((written, complete, should_transmit)) => {
-                    let _ = should_transmit;
-                    // Always wake to send stream ID credit; flow control wake is covered too.
+                Ok((written, complete, _)) => {
                     state.wake();
                     drop(state);
                     return Poll::Ready(Ok((written, complete)));
@@ -866,6 +837,7 @@ impl Future for AcceptUniAndReadChunks<'_, '_> {
                 }
                 Err(ProtoReadError::Blocked) => {
                     // Shouldn't happen for finished streams; fall through to wait.
+                    // TODO: return an error
                 }
             }
         } else if let Some(ref e) = state.error {
@@ -918,7 +890,7 @@ impl Future for AcceptBi<'_> {
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Bi, false))?;
+        let (conn, id, is_0rtt) = ready!(poll_accept(ctx, this.conn, this.notify, Dir::Bi))?;
         Poll::Ready(Ok((
             SendStream::new(conn.clone(), id, is_0rtt),
             RecvStream::new(conn, id, is_0rtt),
@@ -931,17 +903,11 @@ fn poll_accept<'a>(
     conn: &'a ConnectionRef,
     mut notify: Pin<&mut Notified<'a>>,
     dir: Dir,
-    finished_streams_only: bool, // FIXME
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
     let mut state = conn.state.lock("poll_accept");
     // Check for incoming streams before checking `state.error` so that already-received streams,
     // which are necessarily finite, can be drained from a closed connection.
-    let id = if dir == Dir::Uni && finished_streams_only {
-        state.inner.streams().accept_finished(dir)
-    } else {
-        state.inner.streams().accept(dir)
-    };
-    if let Some(id) = id {
+    if let Some(id) = state.inner.streams().accept(dir) {
         let is_0rtt = state.inner.is_handshaking();
         state.wake(); // To send additional stream ID credit
         drop(state); // Release the lock so clone can take it

@@ -10,7 +10,7 @@ use tracing::trace;
 use super::spaces::{Retransmits, ThinRetransmits};
 use crate::{
     Dir, StreamId, VarInt,
-    connection::streams::state::{AcceptMode, get_or_insert_recv, get_or_insert_send},
+    connection::streams::state::{get_or_insert_recv, get_or_insert_send},
     frame,
 };
 
@@ -65,8 +65,8 @@ impl<'a> Streams<'a> {
     /// Returns `None` if there are no new incoming streams for this connection.
     /// Has no impact on the data flow-control or stream concurrency limits.
     pub fn accept(&mut self, dir: Dir) -> Option<StreamId> {
-        if matches!(self.state.accept_mode[dir as usize], AcceptMode::Finished) {
-            return self.accept_finished(dir);
+        if dir == Dir::Uni && self.state.accept_uni_finished_only {
+            return self.accept_uni_finished();
         }
 
         if self.state.next_remote[dir as usize] == self.state.next_reported_remote[dir as usize] {
@@ -83,11 +83,8 @@ impl<'a> Streams<'a> {
     }
 
     /// Accept a remotely initiated stream only if it has finished and all data is buffered.
-    pub fn accept_finished(&mut self, dir: Dir) -> Option<StreamId> {
-        match dir {
-            Dir::Uni => self.state.finished_uni_streams.pop_front(),
-            Dir::Bi => None, // TODO: implement
-        }
+    pub fn accept_uni_finished(&mut self) -> Option<StreamId> {
+        self.state.finished_uni_streams.pop_front()
     }
 
     #[cfg(fuzzing)]
@@ -183,31 +180,37 @@ impl RecvStream<'_> {
         out: &mut [Bytes],
     ) -> Result<(usize, bool, bool), ReadError> {
         let mut chunks = self.read(true).map_err(|e| match e {
-            ReadableError::ClosedStream => ReadError::Blocked,
-            ReadableError::IllegalOrderedRead => ReadError::Blocked,
+            ReadableError::ClosedStream | ReadableError::IllegalOrderedRead => ReadError::Blocked,
         })?;
+
         let mut written = 0;
-        loop {
-            if written == out.len() {
-                let st = chunks.finalize();
-                return Ok((written, false, st.should_transmit()));
-            }
+        let mut hit_end = false;
+        let mut err: Option<ReadError> = None;
+
+        while written < out.len() {
             match chunks.next(usize::MAX) {
                 Ok(Some(chunk)) => {
                     out[written] = chunk.bytes;
                     written += 1;
                 }
                 Ok(None) => {
-                    let st = chunks.finalize();
-                    return Ok((written, true, st.should_transmit()));
+                    hit_end = true;
+                    break;
                 }
-                Err(ReadError::Blocked) => {
-                    let _ = chunks.finalize();
-                    return Err(ReadError::Blocked);
+                Err(e) => {
+                    err = Some(e);
+                    break;
                 }
-                Err(ReadError::Reset(code)) => return Err(ReadError::Reset(code)),
             }
         }
+
+        let st = chunks.finalize();
+
+        if let Some(e) = err {
+            return Err(e);
+        }
+
+        Ok((written, hit_end, st.should_transmit()))
     }
 
     /// Check whether this stream has been reset by the peer, returning the reset error code if so
