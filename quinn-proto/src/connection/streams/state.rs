@@ -286,18 +286,20 @@ impl StreamsState {
             return Ok(ShouldTransmit(false));
         }
 
+        // We need to know if the stream becomes complete after adding this new payload.
+        // Only in this case self.on_stream_frame() should report the stream as complete.
+        // Otherwise, we risk adding the same stream multiple times upon receiving duplicates.
+        let check_completion = id.dir() == Dir::Uni && self.accept_uni_finished_only;
+        let was_complete = check_completion && rs.is_all_data_available();
+
         let (new_bytes, closed) =
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
-        let all_data_available = if id.dir() == Dir::Uni && self.accept_uni_finished_only {
-            rs.is_all_data_available()
-        } else {
-            false
-        };
-
         if !rs.stopped {
-            self.on_stream_frame(true, id, all_data_available);
+            let became_complete = check_completion && !was_complete && rs.is_all_data_available();
+
+            self.on_stream_frame(true, id, became_complete);
             return Ok(ShouldTransmit(false));
         }
 
