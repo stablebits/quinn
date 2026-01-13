@@ -73,6 +73,7 @@ pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
+    AcceptAnyCompleteUni, AcceptAnyCompleteUniWithData, AcceptAnyCompleteUniWithDataError,
     AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
     SendDatagramError, ZeroRttAccepted,
 };

@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::BufMut;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, trace};
 
 use super::{
@@ -95,6 +95,13 @@ pub struct StreamsState {
     opened: [bool; 2],
     // Next to report to the application, once opened
     pub(super) next_reported_remote: [u64; 2],
+    /// Uni streams that have all their data available (finished and fully buffered).
+    /// Used by `accept_any_complete_uni()` to return streams out of order.
+    pub(super) complete_uni_streams: VecDeque<StreamId>,
+    /// Uni streams that are being tracked by `accept_any_complete_uni()`.
+    pub(super) incomplete_uni_streams: FxHashSet<StreamId>,
+    /// Whether the application needs to be notified about available complete uni streams
+    complete_uni_streams_available: bool,
     /// Number of outbound streams
     ///
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
@@ -164,6 +171,9 @@ impl StreamsState {
             next_remote: [0, 0],
             opened: [false, false],
             next_reported_remote: [0, 0],
+            complete_uni_streams: VecDeque::new(),
+            incomplete_uni_streams: FxHashSet::default(),
+            complete_uni_streams_available: false,
             send_streams: 0,
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
@@ -279,6 +289,16 @@ impl StreamsState {
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
+            // Report complete streams for `accept_any_complete_uni()`
+            if id.dir() == Dir::Uni
+                && self.incomplete_uni_streams.contains(&id)
+                // run it only for incomplete streams
+                && rs.is_all_data_available()
+            {
+                self.complete_uni_streams_available = true;
+                self.complete_uni_streams.push_back(id);
+                self.incomplete_uni_streams.remove(&id);
+            }
             self.on_stream_frame(true, id);
             return Ok(ShouldTransmit(false));
         }
@@ -332,10 +352,14 @@ impl StreamsState {
         let bytes_read = rs.assembler.bytes_read();
         let stopped = rs.stopped;
         let end = rs.end;
+        let was_incomplete = id.dir() == Dir::Uni && self.incomplete_uni_streams.remove(&id);
         if stopped {
             // Stopped streams should be disposed immediately on reset
             let rs = self.recv.remove(&id).flatten().unwrap();
             self.stream_recv_freed(id, rs);
+        } else if was_incomplete {
+            self.complete_uni_streams_available = true;
+            self.complete_uni_streams.push_back(id);
         }
         self.on_stream_frame(!stopped, id);
 
@@ -758,6 +782,10 @@ impl StreamsState {
 
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
+        if mem::replace(&mut self.complete_uni_streams_available, false) {
+            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
+        }
+
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
