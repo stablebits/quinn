@@ -163,6 +163,14 @@ impl Recv {
         }
     }
 
+    /// Check if all stream data is available (stream is finished and all data is buffered)
+    pub(super) fn is_all_data_available(&self) -> bool {
+        match self.final_offset() {
+            Some(final_offset) => self.assembler.is_all_data_available(final_offset),
+            None => false,
+        }
+    }
+
     /// Returns `false` iff the reset was redundant
     pub(super) fn reset(
         &mut self,
@@ -426,6 +434,17 @@ impl From<IllegalOrderedRead> for ReadableError {
     fn from(_: IllegalOrderedRead) -> Self {
         Self::IllegalOrderedRead
     }
+}
+
+/// Errors triggered by [`RecvStream::read_to_end`](super::RecvStream::read_to_end)
+#[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ReadToEndError {
+    /// Error opening the stream for reading
+    #[error(transparent)]
+    Readable(#[from] ReadableError),
+    /// Error while reading chunks
+    #[error(transparent)]
+    Read(#[from] ReadError),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
