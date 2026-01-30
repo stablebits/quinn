@@ -15,7 +15,7 @@ use crate::{
 };
 
 mod recv;
-use recv::Recv;
+pub(crate) use recv::Recv;
 pub use recv::{Chunks, ReadError, ReadToEndError, ReadableError};
 
 mod send;
@@ -97,6 +97,23 @@ impl<'a> Streams<'a> {
             }
             None
         })
+    }
+
+    /// Like [`accept_any_complete_uni`](Self::accept_any_complete_uni), but also removes and
+    /// returns the stream's Recv in one operation, avoiding a separate hash lookup.
+    pub(crate) fn accept_any_complete_uni_recv(&mut self) -> Option<(StreamId, Box<Recv>)> {
+        // First check the complete queue
+        if let Some(result) = self.state.take_complete_uni_recv() {
+            return Some(result);
+        }
+
+        // Check new streams
+        while let Some(id) = self.accept(Dir::Uni) {
+            if let Some(recv) = self.state.take_recv_if_complete(id) {
+                return Some((id, recv));
+            }
+        }
+        None
     }
 
     /// Check if a stream has all its data available. If not, mark it for tracking

@@ -900,6 +900,37 @@ impl StreamsState {
         }
     }
 
+    /// Pop a complete uni stream and remove its Recv in one operation
+    ///
+    /// Returns the stream ID and its Recv, avoiding a separate hash lookup.
+    pub(crate) fn take_complete_uni_recv(&mut self) -> Option<(StreamId, Box<Recv>)> {
+        let id = self.complete_uni_streams.pop_front()?;
+        let recv = self.recv.remove(&id)??.into_inner();
+        Some((id, recv))
+    }
+
+    /// Take the Recv for a stream if it's complete, otherwise mark it for tracking
+    ///
+    /// Returns the Recv if the stream has all data available.
+    /// If not complete, marks the stream for completion tracking and returns None.
+    pub(super) fn take_recv_if_complete(&mut self, id: StreamId) -> Option<Box<Recv>> {
+        // Use entry API for single hash lookup
+        let mut entry = match self.recv.entry(id) {
+            hash_map::Entry::Occupied(e) => e,
+            hash_map::Entry::Vacant(_) => return None,
+        };
+
+        {
+            let recv = entry.get_mut().as_mut()?.as_open_recv_mut()?;
+            if !recv.is_all_data_available() {
+                recv.tracked_for_completion = true;
+                return None;
+            }
+        }
+
+        Some(entry.remove()?.into_inner())
+    }
+
     /// Adds credits to the connection flow control window
     ///
     /// Returns whether a `MAX_DATA` frame should be enqueued as soon as possible.

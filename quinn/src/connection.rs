@@ -920,39 +920,60 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
 
         // Check for finished streams before checking errors so that already-received streams
         // can be drained from a closed connection.
-        if let Some(id) = state.inner.streams().accept_any_complete_uni() {
-            // Read all data from the stream while holding the lock
-            match state.inner.recv_stream(id).read_to_end(this.data) {
-                Ok(_) => {
-                    state.wake();
-                    return Poll::Ready(Ok(id));
+        // Use accept_uni_with_chunks to avoid redundant hash lookup
+        let result = {
+            let Some(result) = state.inner.accept_uni_with_chunks(false) else {
+                // No complete stream available, check for errors
+                if let Some(ref e) = state.error {
+                    return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(
+                        e.clone(),
+                    )));
                 }
-                Err(proto::ReadToEndError::Read(proto::ReadError::Reset(code))) => {
-                    return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::Reset {
-                        stream_id: id,
-                        error_code: code,
-                    }));
+                return poll_accept_any_complete_uni_notifiers(
+                    ctx,
+                    this.conn,
+                    this.notify_incoming,
+                    this.notify_complete,
+                );
+            };
+
+            let (id, mut chunks) = match result {
+                Ok(v) => v,
+                Err(proto::ReadableError::ClosedStream) => {
+                    unreachable!("complete stream should be readable");
                 }
-                Err(
-                    proto::ReadToEndError::Read(proto::ReadError::Blocked)
-                    | proto::ReadToEndError::Readable(_),
-                ) => {
-                    // These shouldn't happen for streams from accept_any_complete_uni()
-                    unreachable!("complete stream should be readable: {id}");
+                Err(proto::ReadableError::IllegalOrderedRead) => {
+                    unreachable!("ordered=false should not cause IllegalOrderedRead");
+                }
+            };
+
+            // Read all data from the stream
+            this.data.clear();
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => {
+                        this.data.push(chunk.bytes);
+                    }
+                    Ok(None) => {
+                        break Ok(id);
+                    }
+                    Err(proto::ReadError::Reset(code)) => {
+                        break Err(AcceptAnyCompleteUniWithDataError::Reset {
+                            stream_id: id,
+                            error_code: code,
+                        });
+                    }
+                    Err(proto::ReadError::Blocked) => {
+                        // Shouldn't happen for streams from accept_uni_with_chunks()
+                        unreachable!("complete stream should be readable: {id}");
+                    }
                 }
             }
-        } else if let Some(ref e) = state.error {
-            return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(
-                e.clone(),
-            )));
-        }
+            // chunks is dropped here, releasing the borrow
+        };
 
-        poll_accept_any_complete_uni_notifiers(
-            ctx,
-            this.conn,
-            this.notify_incoming,
-            this.notify_complete,
-        )
+        state.wake();
+        Poll::Ready(result)
     }
 }
 

@@ -428,6 +428,24 @@ impl Connection {
         }
     }
 
+    /// Accept a complete unidirectional stream and get its data reader in one operation
+    ///
+    /// Returns `None` if there are no complete streams available.
+    pub fn accept_uni_with_chunks(
+        &mut self,
+        ordered: bool,
+    ) -> Option<Result<(StreamId, Chunks<'_>), ReadableError>> {
+        let (id, recv) = self.streams().accept_any_complete_uni_recv()?;
+        let chunks = Chunks::from_recv(
+            id,
+            ordered,
+            recv,
+            &mut self.streams,
+            &mut self.spaces[SpaceId::Data].pending,
+        );
+        Some(chunks.map(|c| (id, c)))
+    }
+
     /// Provide control over streams
     #[must_use]
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
