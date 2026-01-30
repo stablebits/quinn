@@ -91,22 +91,33 @@ impl<'a> Streams<'a> {
         self.state.complete_uni_streams.pop_front().or_else(|| {
             // If no, check new streams
             while let Some(id) = self.accept(Dir::Uni) {
-                if self.is_all_data_available(id) {
+                if self.check_complete_or_track(id) {
                     return Some(id);
                 }
-                self.state.incomplete_uni_streams.insert(id);
             }
             None
         })
     }
 
-    fn is_all_data_available(&self, id: StreamId) -> bool {
-        self.state
+    /// Check if a stream has all its data available. If not, mark it for tracking
+    /// so we get notified when it becomes complete.
+    fn check_complete_or_track(&mut self, id: StreamId) -> bool {
+        let Some(recv) = self
+            .state
             .recv
-            .get(&id)
-            .and_then(|s| s.as_ref())
-            .and_then(|s| s.as_open_recv())
-            .is_some_and(|rs| rs.is_all_data_available())
+            .get_mut(&id)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_open_recv_mut())
+        else {
+            return false;
+        };
+
+        if recv.is_all_data_available() {
+            true
+        } else {
+            recv.tracked_for_completion = true;
+            false
+        }
     }
 
     #[cfg(fuzzing)]

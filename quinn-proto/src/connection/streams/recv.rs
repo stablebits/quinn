@@ -18,6 +18,9 @@ pub(super) struct Recv {
     sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    /// Whether this stream is being tracked by `accept_any_complete_uni()`.
+    /// Set when the stream is accepted but not yet complete, cleared when it becomes complete.
+    pub(super) tracked_for_completion: bool,
 }
 
 impl Recv {
@@ -28,6 +31,7 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            tracked_for_completion: false,
         })
     }
 
@@ -38,6 +42,7 @@ impl Recv {
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.tracked_for_completion = false;
     }
 
     /// Process a STREAM frame

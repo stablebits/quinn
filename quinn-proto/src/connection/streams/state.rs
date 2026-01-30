@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::BufMut;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
@@ -98,8 +98,6 @@ pub struct StreamsState {
     /// Uni streams that have all their data available (finished and fully buffered).
     /// Used by `accept_any_complete_uni()` to return streams out of order.
     pub(super) complete_uni_streams: VecDeque<StreamId>,
-    /// Uni streams that are being tracked by `accept_any_complete_uni()`.
-    pub(super) incomplete_uni_streams: FxHashSet<StreamId>,
     /// Whether the application needs to be notified about available complete uni streams
     complete_uni_streams_available: bool,
     /// Number of outbound streams
@@ -172,7 +170,6 @@ impl StreamsState {
             opened: [false, false],
             next_reported_remote: [0, 0],
             complete_uni_streams: VecDeque::new(),
-            incomplete_uni_streams: FxHashSet::default(),
             complete_uni_streams_available: false,
             send_streams: 0,
             pending: PendingStreamsQueue::new(),
@@ -291,13 +288,12 @@ impl StreamsState {
         if !rs.stopped {
             // Report complete streams for `accept_any_complete_uni()`
             if id.dir() == Dir::Uni
-                && self.incomplete_uni_streams.contains(&id)
-                // run it only for incomplete streams
+                && rs.tracked_for_completion
                 && rs.is_all_data_available()
             {
                 self.complete_uni_streams_available = true;
                 self.complete_uni_streams.push_back(id);
-                self.incomplete_uni_streams.remove(&id);
+                rs.tracked_for_completion = false;
             }
             self.on_stream_frame(true, id);
             return Ok(ShouldTransmit(false));
@@ -352,7 +348,8 @@ impl StreamsState {
         let bytes_read = rs.assembler.bytes_read();
         let stopped = rs.stopped;
         let end = rs.end;
-        let was_incomplete = id.dir() == Dir::Uni && self.incomplete_uni_streams.remove(&id);
+        let was_incomplete =
+            id.dir() == Dir::Uni && std::mem::replace(&mut rs.tracked_for_completion, false);
         if stopped {
             // Stopped streams should be disposed immediately on reset
             let rs = self.recv.remove(&id).flatten().unwrap();
