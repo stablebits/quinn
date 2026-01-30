@@ -921,7 +921,7 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
         // Check for finished streams before checking errors so that already-received streams
         // can be drained from a closed connection.
         // Use accept_uni_with_chunks to avoid redundant hash lookup
-        let result = {
+        let (result, should_transmit) = {
             let Some(result) = state.inner.accept_uni_with_chunks(false) else {
                 // No complete stream available, check for errors
                 if let Some(ref e) = state.error {
@@ -949,7 +949,7 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
 
             // Read all data from the stream
             this.data.clear();
-            loop {
+            let result = loop {
                 match chunks.next(usize::MAX) {
                     Ok(Some(chunk)) => {
                         this.data.push(chunk.bytes);
@@ -968,11 +968,14 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
                         unreachable!("complete stream should be readable: {id}");
                     }
                 }
-            }
-            // chunks is dropped here, releasing the borrow
+            };
+            let should_transmit = chunks.finalize();
+            (result, should_transmit)
         };
 
-        state.wake();
+        if should_transmit.should_transmit() {
+            state.wake();
+        }
         Poll::Ready(result)
     }
 }
