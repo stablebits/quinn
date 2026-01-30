@@ -11,7 +11,7 @@ use crate::connection::streams::state::StreamRecv;
 use crate::{TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
-pub(super) struct Recv {
+pub(crate) struct Recv {
     // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
     pub(super) assembler: Assembler,
@@ -265,7 +265,7 @@ pub struct Chunks<'a> {
 }
 
 impl<'a> Chunks<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         id: StreamId,
         ordered: bool,
         streams: &'a mut StreamsState,
@@ -282,6 +282,30 @@ impl<'a> Chunks<'a> {
                 false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
             };
 
+        recv.assembler.ensure_ordering(ordered)?;
+        Ok(Self {
+            id,
+            ordered,
+            streams,
+            pending,
+            state: ChunksState::Readable(recv),
+            read: 0,
+        })
+    }
+
+    /// Create Chunks from an already-removed Recv
+    ///
+    /// This avoids the hash lookup in `new()` when the caller already has the Recv.
+    pub(crate) fn from_recv(
+        id: StreamId,
+        ordered: bool,
+        mut recv: Box<Recv>,
+        streams: &'a mut StreamsState,
+        pending: &'a mut Retransmits,
+    ) -> Result<Self, ReadableError> {
+        if recv.stopped {
+            return Err(ReadableError::ClosedStream);
+        }
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
             id,
