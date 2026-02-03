@@ -922,7 +922,7 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
         // can be drained from a closed connection.
         // Use accept_uni_with_chunks to avoid redundant hash lookup
         let (result, should_transmit) = {
-            let Some(result) = state.inner.accept_uni_with_chunks(false) else {
+            let Some(result) = state.inner.accept_uni_with_chunks(true) else {
                 // No complete stream available, check for errors
                 if let Some(ref e) = state.error {
                     return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(
