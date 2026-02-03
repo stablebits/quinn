@@ -387,6 +387,7 @@ impl Connection {
         &'a self,
         data: &'a mut Vec<Bytes>,
     ) -> AcceptAnyCompleteUniWithData<'a> {
+        data.clear();
         AcceptAnyCompleteUniWithData {
             conn: &self.0,
             data,
@@ -948,7 +949,6 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
             };
 
             // Read all data from the stream
-            this.data.clear();
             let result = loop {
                 match chunks.next(usize::MAX) {
                     Ok(Some(chunk)) => {
