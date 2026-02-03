@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::BufMut;
-use rustc_hash::FxHashMap;
+use nohash_hasher::IntMap;
 use tracing::{debug, trace};
 
 use super::{
@@ -69,8 +69,8 @@ impl StreamRecv {
 pub struct StreamsState {
     pub(super) side: Side,
     // Set of streams that are currently open, or could be immediately opened by the peer
-    pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
-    pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
+    pub(super) send: IntMap<StreamId, Option<Box<Send>>>,
+    pub(super) recv: IntMap<StreamId, Option<StreamRecv>>,
     pub(super) free_recv: Vec<StreamRecv>,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
@@ -156,8 +156,8 @@ impl StreamsState {
     ) -> Self {
         let mut this = Self {
             side,
-            send: FxHashMap::default(),
-            recv: FxHashMap::default(),
+            send: IntMap::default(),
+            recv: IntMap::default(),
             free_recv: Vec::new(),
             next: [0, 0],
             max: [0, 0],
