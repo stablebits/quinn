@@ -4,6 +4,7 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
+    ops::Sub,
     pin::Pin,
     sync::{
         Arc,
@@ -916,6 +917,20 @@ pub struct AcceptCompletePollStats {
     pub pending_lock_wait_us: u64,
     /// Total time in microseconds spent waiting for lock during successful polls
     pub success_lock_wait_us: u64,
+}
+
+impl Sub for AcceptCompletePollStats {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            total: self.total.saturating_sub(other.total),
+            success: self.success.saturating_sub(other.success),
+            pending: self.pending.saturating_sub(other.pending),
+            pending_lock_wait_us: self.pending_lock_wait_us.saturating_sub(other.pending_lock_wait_us),
+            success_lock_wait_us: self.success_lock_wait_us.saturating_sub(other.success_lock_wait_us),
+        }
+    }
 }
 
 /// Errors that can occur when accepting a finished uni stream and reading its data
