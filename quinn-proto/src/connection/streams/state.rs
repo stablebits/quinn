@@ -287,15 +287,18 @@ impl StreamsState {
 
         if !rs.stopped {
             // Report complete streams for `accept_any_complete_uni()`
-            if id.dir() == Dir::Uni
+            let just_completed = id.dir() == Dir::Uni
                 && rs.tracked_for_completion
-                && rs.is_all_data_available()
-            {
+                && rs.is_all_data_available();
+            if just_completed {
                 self.complete_uni_streams_available = true;
                 self.complete_uni_streams.push_back(id);
                 rs.tracked_for_completion = false;
             }
-            self.on_stream_frame(true, id);
+            // Skip setting `opened` for streams that just became complete to avoid
+            // double-notifying accept_any_complete_uni_with_data() which subscribes
+            // to both stream_incoming and complete_uni_stream.
+            self.on_stream_frame_inner(true, id, !just_completed);
             return Ok(ShouldTransmit(false));
         }
 
@@ -626,6 +629,19 @@ impl StreamsState {
 
     /// Notify the application that new streams were opened or a stream became readable.
     fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
+        self.on_stream_frame_inner(notify_readable, stream, true);
+    }
+
+    /// Inner implementation with control over whether to set `opened` flag.
+    /// `set_opened` should be false when the stream just became complete, to avoid
+    /// double-notifying accept_any_complete_uni_with_data() which subscribes to both
+    /// stream_incoming and complete_uni_stream.
+    fn on_stream_frame_inner(
+        &mut self,
+        notify_readable: bool,
+        stream: StreamId,
+        set_opened: bool,
+    ) {
         if stream.initiator() == self.side {
             // Notifying about the opening of locally-initiated streams would be redundant.
             if notify_readable {
@@ -636,7 +652,9 @@ impl StreamsState {
         let next = &mut self.next_remote[stream.dir() as usize];
         if stream.index() >= *next {
             *next = stream.index() + 1;
-            self.opened[stream.dir() as usize] = true;
+            if set_opened {
+                self.opened[stream.dir() as usize] = true;
+            }
         } else if notify_readable {
             self.events.push_back(StreamEvent::Readable { id: stream });
         }
@@ -779,16 +797,13 @@ impl StreamsState {
 
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
-        // Opened is checked before AcceptAnyComplete so that when both are set,
-        // accept_any_complete_uni_with_data() doesn't pay the cost of processing
-        // the Opened event (which calls notify_waiters) before acquiring the lock.
+        if mem::replace(&mut self.complete_uni_streams_available, false) {
+            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
+        }
+
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
-        }
-
-        if mem::replace(&mut self.complete_uni_streams_available, false) {
-            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
         }
 
         if self.write_limit() > 0 {
