@@ -410,6 +410,11 @@ impl Connection {
                 .shared
                 .accept_complete_poll_pending_lock_wait_us
                 .load(Ordering::Relaxed),
+            success_lock_wait_us: self
+                .0
+                .shared
+                .accept_complete_poll_success_lock_wait_us
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -909,6 +914,8 @@ pub struct AcceptCompletePollStats {
     pub pending: u64,
     /// Total time in microseconds spent waiting for lock during pending polls
     pub pending_lock_wait_us: u64,
+    /// Total time in microseconds spent waiting for lock during successful polls
+    pub success_lock_wait_us: u64,
 }
 
 /// Errors that can occur when accepting a finished uni stream and reading its data
@@ -1025,11 +1032,15 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
             state.wake();
         }
 
-        // Instrumentation: track successful polls
+        // Instrumentation: track successful polls and lock wait time
         this.conn
             .shared
             .accept_complete_poll_success
             .fetch_add(1, Ordering::Relaxed);
+        this.conn
+            .shared
+            .accept_complete_poll_success_lock_wait_us
+            .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
 
         Poll::Ready(result)
     }
@@ -1082,10 +1093,13 @@ fn poll_accept<'a>(
         let is_0rtt = state.inner.is_handshaking();
         state.wake(); // To send additional stream ID credit
         drop(state); // Release the lock so clone can take it
-        // Instrumentation: track successful polls
+        // Instrumentation: track successful polls and lock wait time
         conn.shared
             .accept_complete_poll_success
             .fetch_add(1, Ordering::Relaxed);
+        conn.shared
+            .accept_complete_poll_success_lock_wait_us
+            .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
         return Poll::Ready(Ok((conn.clone(), id, is_0rtt)));
     } else if let Some(ref e) = state.error {
         return Poll::Ready(Err(e.clone()));
@@ -1262,6 +1276,8 @@ pub(crate) struct Shared {
     pub(crate) accept_complete_poll_pending: AtomicU64,
     /// Instrumentation: total microseconds spent waiting for lock during pending polls
     pub(crate) accept_complete_poll_pending_lock_wait_us: AtomicU64,
+    /// Instrumentation: total microseconds spent waiting for lock during successful polls
+    pub(crate) accept_complete_poll_success_lock_wait_us: AtomicU64,
 }
 
 pub(crate) struct State {

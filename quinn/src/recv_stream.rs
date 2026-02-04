@@ -390,29 +390,41 @@ impl RecvStream {
 
         match status {
             ReadStatus::Readable(read) => {
-                // Instrumentation: track successful polls
+                // Instrumentation: track successful polls and lock wait time
                 self.conn
                     .shared
                     .accept_complete_poll_success
                     .fetch_add(1, Ordering::Relaxed);
+                self.conn
+                    .shared
+                    .accept_complete_poll_success_lock_wait_us
+                    .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(Some(read)))
             }
             ReadStatus::Finished(read) => {
                 self.all_data_read = true;
-                // Instrumentation: track successful polls
+                // Instrumentation: track successful polls and lock wait time
                 self.conn
                     .shared
                     .accept_complete_poll_success
                     .fetch_add(1, Ordering::Relaxed);
+                self.conn
+                    .shared
+                    .accept_complete_poll_success_lock_wait_us
+                    .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(read))
             }
             ReadStatus::Failed(read, Blocked) => match read {
                 Some(val) => {
-                    // Instrumentation: track successful polls (partial read)
+                    // Instrumentation: track successful polls and lock wait time (partial read)
                     self.conn
                         .shared
                         .accept_complete_poll_success
                         .fetch_add(1, Ordering::Relaxed);
+                    self.conn
+                        .shared
+                        .accept_complete_poll_success_lock_wait_us
+                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Ready(Ok(Some(val)))
                 }
                 None => {
@@ -436,20 +448,28 @@ impl RecvStream {
                 None => {
                     self.all_data_read = true;
                     self.reset = Some(error_code);
-                    // Instrumentation: track successful polls (reset counts as completion)
+                    // Instrumentation: track successful polls and lock wait time (reset counts as completion)
                     self.conn
                         .shared
                         .accept_complete_poll_success
                         .fetch_add(1, Ordering::Relaxed);
+                    self.conn
+                        .shared
+                        .accept_complete_poll_success_lock_wait_us
+                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Ready(Err(ReadError::Reset(error_code)))
                 }
                 done => {
                     self.reset = Some(error_code);
-                    // Instrumentation: track successful polls
+                    // Instrumentation: track successful polls and lock wait time
                     self.conn
                         .shared
                         .accept_complete_poll_success
                         .fetch_add(1, Ordering::Relaxed);
+                    self.conn
+                        .shared
+                        .accept_complete_poll_success_lock_wait_us
+                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Ready(Ok(done))
                 }
             },
