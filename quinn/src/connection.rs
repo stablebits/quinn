@@ -405,6 +405,11 @@ impl Connection {
             total: self.0.shared.accept_complete_poll_total.load(Ordering::Relaxed),
             success: self.0.shared.accept_complete_poll_success.load(Ordering::Relaxed),
             pending: self.0.shared.accept_complete_poll_pending.load(Ordering::Relaxed),
+            pending_lock_wait_us: self
+                .0
+                .shared
+                .accept_complete_poll_pending_lock_wait_us
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -902,6 +907,8 @@ pub struct AcceptCompletePollStats {
     pub success: u64,
     /// Number of polls that returned Pending (no stream available)
     pub pending: u64,
+    /// Total time in microseconds spent waiting for lock during pending polls
+    pub pending_lock_wait_us: u64,
 }
 
 /// Errors that can occur when accepting a finished uni stream and reading its data
@@ -944,10 +951,12 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
             .accept_complete_poll_total
             .fetch_add(1, Ordering::Relaxed);
 
+        let lock_start = Instant::now();
         let mut state = this
             .conn
             .state
             .lock("poll_accept_any_complete_uni_with_data");
+        let lock_wait = lock_start.elapsed();
 
         // Check for finished streams before checking errors so that already-received streams
         // can be drained from a closed connection.
@@ -960,11 +969,15 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
                         e.clone(),
                     )));
                 }
-                // Instrumentation: track pending polls
+                // Instrumentation: track pending polls and lock wait time
                 this.conn
                     .shared
                     .accept_complete_poll_pending
                     .fetch_add(1, Ordering::Relaxed);
+                this.conn
+                    .shared
+                    .accept_complete_poll_pending_lock_wait_us
+                    .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                 return poll_accept_any_complete_uni_notifiers(
                     ctx,
                     this.conn,
@@ -1060,7 +1073,9 @@ fn poll_accept<'a>(
         .accept_complete_poll_total
         .fetch_add(1, Ordering::Relaxed);
 
+    let lock_start = Instant::now();
     let mut state = conn.state.lock("poll_accept");
+    let lock_wait = lock_start.elapsed();
     // Check for incoming streams before checking `state.error` so that already-received streams,
     // which are necessarily finite, can be drained from a closed connection.
     if let Some(id) = state.inner.streams().accept(dir) {
@@ -1079,10 +1094,13 @@ fn poll_accept<'a>(
         match notify.as_mut().poll(ctx) {
             // `state` lock ensures we didn't race with readiness
             Poll::Pending => {
-                // Instrumentation: track pending polls
+                // Instrumentation: track pending polls and lock wait time
                 conn.shared
                     .accept_complete_poll_pending
                     .fetch_add(1, Ordering::Relaxed);
+                conn.shared
+                    .accept_complete_poll_pending_lock_wait_us
+                    .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                 return Poll::Pending;
             }
             // Spurious wakeup, get a new future
@@ -1242,6 +1260,8 @@ pub(crate) struct Shared {
     pub(crate) accept_complete_poll_success: AtomicU64,
     /// Instrumentation: poll invocations that returned Pending
     pub(crate) accept_complete_poll_pending: AtomicU64,
+    /// Instrumentation: total microseconds spent waiting for lock during pending polls
+    pub(crate) accept_complete_poll_pending_lock_wait_us: AtomicU64,
 }
 
 pub(crate) struct State {

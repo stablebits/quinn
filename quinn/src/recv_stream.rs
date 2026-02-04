@@ -366,7 +366,9 @@ impl RecvStream {
             .accept_complete_poll_total
             .fetch_add(1, Ordering::Relaxed);
 
+        let lock_start = crate::Instant::now();
         let mut conn = self.conn.state.lock("RecvStream::poll_read");
+        let lock_wait = lock_start.elapsed();
         if self.is_0rtt {
             conn.check_0rtt().map_err(|()| ReadError::ZeroRttRejected)?;
         }
@@ -418,11 +420,15 @@ impl RecvStream {
                         return Poll::Ready(Err(ReadError::ConnectionLost(x.clone())));
                     }
                     conn.blocked_readers.insert(self.stream, cx.waker().clone());
-                    // Instrumentation: track pending polls
+                    // Instrumentation: track pending polls and lock wait time
                     self.conn
                         .shared
                         .accept_complete_poll_pending
                         .fetch_add(1, Ordering::Relaxed);
+                    self.conn
+                        .shared
+                        .accept_complete_poll_pending_lock_wait_us
+                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Pending
                 }
             },
