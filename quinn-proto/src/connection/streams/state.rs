@@ -287,9 +287,8 @@ impl StreamsState {
 
         if !rs.stopped {
             // Report complete streams for `accept_any_complete_uni()`
-            let just_completed = id.dir() == Dir::Uni
-                && rs.tracked_for_completion
-                && rs.is_all_data_available();
+            let just_completed =
+                id.dir() == Dir::Uni && rs.tracked_for_completion && rs.is_all_data_available();
             if just_completed {
                 self.complete_uni_streams_available = true;
                 self.complete_uni_streams.push_back(id);
@@ -635,7 +634,12 @@ impl StreamsState {
 
     /// Inner implementation with control over event firing.
     /// `fire_events` can be false to update state without generating events.
-    fn on_stream_frame_inner(&mut self, notify_readable: bool, stream: StreamId, fire_events: bool) {
+    fn on_stream_frame_inner(
+        &mut self,
+        notify_readable: bool,
+        stream: StreamId,
+        fire_events: bool,
+    ) {
         if stream.initiator() == self.side {
             // Notifying about the opening of locally-initiated streams would be redundant.
             if notify_readable && fire_events {
@@ -791,13 +795,13 @@ impl StreamsState {
 
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
-        if mem::replace(&mut self.complete_uni_streams_available, false) {
-            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
-        }
-
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
+        }
+
+        if mem::replace(&mut self.complete_uni_streams_available, false) {
+            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
         }
 
         if self.write_limit() > 0 {
