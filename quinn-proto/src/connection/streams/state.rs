@@ -98,8 +98,6 @@ pub struct StreamsState {
     /// Uni streams that have all their data available (finished and fully buffered).
     /// Used by `accept_any_complete_uni()` to return streams out of order.
     pub(super) complete_uni_streams: VecDeque<StreamId>,
-    /// Whether the application needs to be notified about available complete uni streams
-    complete_uni_streams_available: bool,
     /// Number of outbound streams
     ///
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
@@ -170,7 +168,6 @@ impl StreamsState {
             opened: [false, false],
             next_reported_remote: [0, 0],
             complete_uni_streams: VecDeque::new(),
-            complete_uni_streams_available: false,
             send_streams: 0,
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
@@ -291,11 +288,13 @@ impl StreamsState {
                 && rs.tracked_for_completion
                 && rs.is_all_data_available();
             if just_completed {
-                self.complete_uni_streams_available = true;
+                // Push to events queue so AcceptAnyComplete is processed later (after Opened,
+                // Writable), reducing lock wait time for accept_any_complete_uni_with_data()
+                self.events
+                    .push_back(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
                 self.complete_uni_streams.push_back(id);
                 rs.tracked_for_completion = false;
-                // Update state but skip events - AcceptAnyComplete is the notification for these
-                // streams, no need to also fire Readable which would just add overhead
+                // Update state but skip Readable event - AcceptAnyComplete is the notification
                 self.on_stream_frame_inner(true, id, false);
             } else {
                 self.on_stream_frame(true, id);
@@ -359,7 +358,9 @@ impl StreamsState {
             let rs = self.recv.remove(&id).flatten().unwrap();
             self.stream_recv_freed(id, rs);
         } else if was_incomplete {
-            self.complete_uni_streams_available = true;
+            // Push to events queue so AcceptAnyComplete is processed later
+            self.events
+                .push_back(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
             self.complete_uni_streams.push_back(id);
         }
         self.on_stream_frame(!stopped, id);
@@ -791,10 +792,6 @@ impl StreamsState {
 
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
-        if mem::replace(&mut self.complete_uni_streams_available, false) {
-            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
-        }
-
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
