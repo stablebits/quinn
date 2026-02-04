@@ -416,16 +416,6 @@ impl Connection {
                 .shared
                 .accept_complete_poll_success_lock_wait_us
                 .load(Ordering::Relaxed),
-            events_after_complete_uni_notify: self
-                .0
-                .shared
-                .events_after_complete_uni_notify
-                .load(Ordering::Relaxed),
-            events_after_opened_uni_notify: self
-                .0
-                .shared
-                .events_after_opened_uni_notify
-                .load(Ordering::Relaxed),
         }
     }
 
@@ -927,10 +917,6 @@ pub struct AcceptCompletePollStats {
     pub pending_lock_wait_us: u64,
     /// Total time in microseconds spent waiting for lock during successful polls
     pub success_lock_wait_us: u64,
-    /// Events processed after complete_uni_stream notification (driver holds lock)
-    pub events_after_complete_uni_notify: u64,
-    /// Events processed after stream_incoming[Uni] notification (driver holds lock)
-    pub events_after_opened_uni_notify: u64,
 }
 
 impl Sub for AcceptCompletePollStats {
@@ -943,12 +929,6 @@ impl Sub for AcceptCompletePollStats {
             pending: self.pending.saturating_sub(other.pending),
             pending_lock_wait_us: self.pending_lock_wait_us.saturating_sub(other.pending_lock_wait_us),
             success_lock_wait_us: self.success_lock_wait_us.saturating_sub(other.success_lock_wait_us),
-            events_after_complete_uni_notify: self
-                .events_after_complete_uni_notify
-                .saturating_sub(other.events_after_complete_uni_notify),
-            events_after_opened_uni_notify: self
-                .events_after_opened_uni_notify
-                .saturating_sub(other.events_after_opened_uni_notify),
         }
     }
 }
@@ -1313,10 +1293,6 @@ pub(crate) struct Shared {
     pub(crate) accept_complete_poll_pending_lock_wait_us: AtomicU64,
     /// Instrumentation: total microseconds spent waiting for lock during successful polls
     pub(crate) accept_complete_poll_success_lock_wait_us: AtomicU64,
-    /// Instrumentation: events processed after complete_uni_stream notification
-    pub(crate) events_after_complete_uni_notify: AtomicU64,
-    /// Instrumentation: events processed after stream_incoming[Uni] notification
-    pub(crate) events_after_opened_uni_notify: AtomicU64,
 }
 
 pub(crate) struct State {
@@ -1475,22 +1451,8 @@ impl State {
     }
 
     fn forward_app_events(&mut self, shared: &Shared) {
-        let mut events_after_complete_uni = 0u64;
-        let mut events_after_opened_uni = 0u64;
-        let mut complete_uni_notified = false;
-        let mut opened_uni_notified = false;
-
         while let Some(event) = self.inner.poll() {
             use proto::Event::*;
-
-            // Count events after each notification type
-            if complete_uni_notified {
-                events_after_complete_uni += 1;
-            }
-            if opened_uni_notified {
-                events_after_opened_uni += 1;
-            }
-
             match event {
                 HandshakeDataReady => {
                     if let Some(x) = self.on_handshake_data.take() {
@@ -1521,7 +1483,6 @@ impl State {
                 Stream(StreamEvent::Writable { id }) => wake_stream(id, &mut self.blocked_writers),
                 Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
                     shared.stream_incoming[Dir::Uni as usize].notify_waiters();
-                    opened_uni_notified = true;
                 }
                 Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
                     shared.stream_incoming[Dir::Bi as usize].notify_waiters();
@@ -1540,7 +1501,6 @@ impl State {
                 Stream(StreamEvent::AcceptAnyComplete { dir }) => {
                     if dir == Dir::Uni {
                         shared.complete_uni_stream.notify_waiters();
-                        complete_uni_notified = true;
                     }
                 }
                 Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
@@ -1549,18 +1509,6 @@ impl State {
                     wake_stream(id, &mut self.blocked_writers);
                 }
             }
-        }
-
-        // Record instrumentation
-        if complete_uni_notified {
-            shared
-                .events_after_complete_uni_notify
-                .fetch_add(events_after_complete_uni, Ordering::Relaxed);
-        }
-        if opened_uni_notified {
-            shared
-                .events_after_opened_uni_notify
-                .fetch_add(events_after_opened_uni, Ordering::Relaxed);
         }
     }
 
