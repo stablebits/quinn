@@ -21,6 +21,7 @@ pub(crate) struct Recv {
     /// Whether this stream is being tracked by `accept_any_complete_uni()`.
     /// Set when the stream is accepted but not yet complete, cleared when it becomes complete.
     pub(super) tracked_for_completion: bool,
+    pub(super) all_data_available: bool,
 }
 
 impl Recv {
@@ -32,6 +33,7 @@ impl Recv {
             end: 0,
             stopped: false,
             tracked_for_completion: false,
+            all_data_available: false,
         })
     }
 
@@ -43,6 +45,7 @@ impl Recv {
         self.end = 0;
         self.stopped = false;
         self.tracked_for_completion = false;
+        self.all_data_available = false;
     }
 
     /// Process a STREAM frame
@@ -85,6 +88,8 @@ impl Recv {
         if !self.stopped {
             self.assembler.insert(frame.offset, frame.data, payload_len);
         }
+
+        self.all_data_available = self.all_data_available || (frame.offset == 0 && frame.fin);
 
         Ok((new_bytes, frame.fin && self.stopped))
     }
@@ -170,10 +175,11 @@ impl Recv {
 
     /// Check if all stream data is available (stream is finished and all data is buffered)
     pub(super) fn is_all_data_available(&self) -> bool {
-        match self.final_offset() {
-            Some(final_offset) => self.assembler.is_all_data_available(final_offset),
-            None => false,
-        }
+        self.all_data_available
+            || match self.final_offset() {
+                Some(final_offset) => self.assembler.is_all_data_available(final_offset),
+                None => false,
+            }
     }
 
     /// Returns `false` iff the reset was redundant
