@@ -366,9 +366,7 @@ impl RecvStream {
             .accept_complete_poll_total
             .fetch_add(1, Ordering::Relaxed);
 
-        let lock_start = crate::Instant::now();
         let mut conn = self.conn.state.lock("RecvStream::poll_read");
-        let lock_wait = lock_start.elapsed();
         if self.is_0rtt {
             conn.check_0rtt().map_err(|()| ReadError::ZeroRttRejected)?;
         }
@@ -390,41 +388,29 @@ impl RecvStream {
 
         match status {
             ReadStatus::Readable(read) => {
-                // Instrumentation: track successful polls and lock wait time
+                // Instrumentation: track successful polls
                 self.conn
                     .shared
                     .accept_complete_poll_success
                     .fetch_add(1, Ordering::Relaxed);
-                self.conn
-                    .shared
-                    .accept_complete_poll_success_lock_wait_us
-                    .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(Some(read)))
             }
             ReadStatus::Finished(read) => {
                 self.all_data_read = true;
-                // Instrumentation: track successful polls and lock wait time
+                // Instrumentation: track successful polls
                 self.conn
                     .shared
                     .accept_complete_poll_success
                     .fetch_add(1, Ordering::Relaxed);
-                self.conn
-                    .shared
-                    .accept_complete_poll_success_lock_wait_us
-                    .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(read))
             }
             ReadStatus::Failed(read, Blocked) => match read {
                 Some(val) => {
-                    // Instrumentation: track successful polls and lock wait time (partial read)
+                    // Instrumentation: track successful polls (partial read)
                     self.conn
                         .shared
                         .accept_complete_poll_success
                         .fetch_add(1, Ordering::Relaxed);
-                    self.conn
-                        .shared
-                        .accept_complete_poll_success_lock_wait_us
-                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Ready(Ok(Some(val)))
                 }
                 None => {
@@ -432,15 +418,11 @@ impl RecvStream {
                         return Poll::Ready(Err(ReadError::ConnectionLost(x.clone())));
                     }
                     conn.blocked_readers.insert(self.stream, cx.waker().clone());
-                    // Instrumentation: track pending polls and lock wait time
+                    // Instrumentation: track pending polls
                     self.conn
                         .shared
                         .accept_complete_poll_pending
                         .fetch_add(1, Ordering::Relaxed);
-                    self.conn
-                        .shared
-                        .accept_complete_poll_pending_lock_wait_us
-                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Pending
                 }
             },
@@ -448,28 +430,20 @@ impl RecvStream {
                 None => {
                     self.all_data_read = true;
                     self.reset = Some(error_code);
-                    // Instrumentation: track successful polls and lock wait time (reset counts as completion)
+                    // Instrumentation: track successful polls (reset counts as completion)
                     self.conn
                         .shared
                         .accept_complete_poll_success
                         .fetch_add(1, Ordering::Relaxed);
-                    self.conn
-                        .shared
-                        .accept_complete_poll_success_lock_wait_us
-                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Ready(Err(ReadError::Reset(error_code)))
                 }
                 done => {
                     self.reset = Some(error_code);
-                    // Instrumentation: track successful polls and lock wait time
+                    // Instrumentation: track successful polls
                     self.conn
                         .shared
                         .accept_complete_poll_success
                         .fetch_add(1, Ordering::Relaxed);
-                    self.conn
-                        .shared
-                        .accept_complete_poll_success_lock_wait_us
-                        .fetch_add(lock_wait.as_micros() as u64, Ordering::Relaxed);
                     Poll::Ready(Ok(done))
                 }
             },
