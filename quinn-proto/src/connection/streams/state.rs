@@ -294,8 +294,9 @@ impl StreamsState {
                 self.complete_uni_streams_available = true;
                 self.complete_uni_streams.push_back(id);
                 rs.tracked_for_completion = false;
-                // Skip on_stream_frame - AcceptAnyComplete is the notification for these streams,
-                // no need to also fire Readable which would just add overhead
+                // Update state but skip events - AcceptAnyComplete is the notification for these
+                // streams, no need to also fire Readable which would just add overhead
+                self.on_stream_frame_inner(true, id, false);
             } else {
                 self.on_stream_frame(true, id);
             }
@@ -629,9 +630,15 @@ impl StreamsState {
 
     /// Notify the application that new streams were opened or a stream became readable.
     fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
+        self.on_stream_frame_inner(notify_readable, stream, true)
+    }
+
+    /// Inner implementation with control over event firing.
+    /// `fire_events` can be false to update state without generating events.
+    fn on_stream_frame_inner(&mut self, notify_readable: bool, stream: StreamId, fire_events: bool) {
         if stream.initiator() == self.side {
             // Notifying about the opening of locally-initiated streams would be redundant.
-            if notify_readable {
+            if notify_readable && fire_events {
                 self.events.push_back(StreamEvent::Readable { id: stream });
             }
             return;
@@ -639,8 +646,10 @@ impl StreamsState {
         let next = &mut self.next_remote[stream.dir() as usize];
         if stream.index() >= *next {
             *next = stream.index() + 1;
-            self.opened[stream.dir() as usize] = true;
-        } else if notify_readable {
+            if fire_events {
+                self.opened[stream.dir() as usize] = true;
+            }
+        } else if notify_readable && fire_events {
             self.events.push_back(StreamEvent::Readable { id: stream });
         }
     }
