@@ -294,11 +294,11 @@ impl StreamsState {
                 self.complete_uni_streams_available = true;
                 self.complete_uni_streams.push_back(id);
                 rs.tracked_for_completion = false;
+                // Skip on_stream_frame - AcceptAnyComplete is the notification for these streams,
+                // no need to also fire Readable which would just add overhead
+            } else {
+                self.on_stream_frame(true, id);
             }
-            // Skip setting `opened` for streams that just became complete to avoid
-            // double-notifying accept_any_complete_uni_with_data() which subscribes
-            // to both stream_incoming and complete_uni_stream.
-            self.on_stream_frame_inner(true, id, !just_completed);
             return Ok(ShouldTransmit(false));
         }
 
@@ -629,19 +629,6 @@ impl StreamsState {
 
     /// Notify the application that new streams were opened or a stream became readable.
     fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
-        self.on_stream_frame_inner(notify_readable, stream, true);
-    }
-
-    /// Inner implementation with control over whether to set `opened` flag.
-    /// `set_opened` should be false when the stream just became complete, to avoid
-    /// double-notifying accept_any_complete_uni_with_data() which subscribes to both
-    /// stream_incoming and complete_uni_stream.
-    fn on_stream_frame_inner(
-        &mut self,
-        notify_readable: bool,
-        stream: StreamId,
-        set_opened: bool,
-    ) {
         if stream.initiator() == self.side {
             // Notifying about the opening of locally-initiated streams would be redundant.
             if notify_readable {
@@ -652,9 +639,7 @@ impl StreamsState {
         let next = &mut self.next_remote[stream.dir() as usize];
         if stream.index() >= *next {
             *next = stream.index() + 1;
-            if set_opened {
-                self.opened[stream.dir() as usize] = true;
-            }
+            self.opened[stream.dir() as usize] = true;
         } else if notify_readable {
             self.events.push_back(StreamEvent::Readable { id: stream });
         }
