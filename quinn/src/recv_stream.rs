@@ -2,7 +2,6 @@ use std::{
     future::{Future, poll_fn},
     io,
     pin::Pin,
-    sync::atomic::Ordering,
     task::{Context, Poll, ready},
 };
 
@@ -360,12 +359,6 @@ impl RecvStream {
             return Poll::Ready(Ok(None));
         }
 
-        // Instrumentation: track total poll invocations
-        self.conn
-            .shared
-            .accept_complete_poll_total
-            .fetch_add(1, Ordering::Relaxed);
-
         let mut conn = self.conn.state.lock("RecvStream::poll_read");
         if self.is_0rtt {
             conn.check_0rtt().map_err(|()| ReadError::ZeroRttRejected)?;
@@ -387,42 +380,18 @@ impl RecvStream {
         };
 
         match status {
-            ReadStatus::Readable(read) => {
-                // Instrumentation: track successful polls
-                self.conn
-                    .shared
-                    .accept_complete_poll_success
-                    .fetch_add(1, Ordering::Relaxed);
-                Poll::Ready(Ok(Some(read)))
-            }
+            ReadStatus::Readable(read) => Poll::Ready(Ok(Some(read))),
             ReadStatus::Finished(read) => {
                 self.all_data_read = true;
-                // Instrumentation: track successful polls
-                self.conn
-                    .shared
-                    .accept_complete_poll_success
-                    .fetch_add(1, Ordering::Relaxed);
                 Poll::Ready(Ok(read))
             }
             ReadStatus::Failed(read, Blocked) => match read {
-                Some(val) => {
-                    // Instrumentation: track successful polls (partial read)
-                    self.conn
-                        .shared
-                        .accept_complete_poll_success
-                        .fetch_add(1, Ordering::Relaxed);
-                    Poll::Ready(Ok(Some(val)))
-                }
+                Some(val) => Poll::Ready(Ok(Some(val))),
                 None => {
                     if let Some(ref x) = conn.error {
                         return Poll::Ready(Err(ReadError::ConnectionLost(x.clone())));
                     }
                     conn.blocked_readers.insert(self.stream, cx.waker().clone());
-                    // Instrumentation: track pending polls
-                    self.conn
-                        .shared
-                        .accept_complete_poll_pending
-                        .fetch_add(1, Ordering::Relaxed);
                     Poll::Pending
                 }
             },
@@ -430,20 +399,10 @@ impl RecvStream {
                 None => {
                     self.all_data_read = true;
                     self.reset = Some(error_code);
-                    // Instrumentation: track successful polls (reset counts as completion)
-                    self.conn
-                        .shared
-                        .accept_complete_poll_success
-                        .fetch_add(1, Ordering::Relaxed);
                     Poll::Ready(Err(ReadError::Reset(error_code)))
                 }
                 done => {
                     self.reset = Some(error_code);
-                    // Instrumentation: track successful polls
-                    self.conn
-                        .shared
-                        .accept_complete_poll_success
-                        .fetch_add(1, Ordering::Relaxed);
                     Poll::Ready(Ok(done))
                 }
             },
