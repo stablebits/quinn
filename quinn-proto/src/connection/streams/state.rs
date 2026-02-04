@@ -779,13 +779,16 @@ impl StreamsState {
 
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
-        if mem::replace(&mut self.complete_uni_streams_available, false) {
-            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
-        }
-
+        // Opened is checked before AcceptAnyComplete so that when both are set,
+        // accept_any_complete_uni_with_data() doesn't pay the cost of processing
+        // the Opened event (which calls notify_waiters) before acquiring the lock.
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
+        }
+
+        if mem::replace(&mut self.complete_uni_streams_available, false) {
+            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
         }
 
         if self.write_limit() > 0 {
