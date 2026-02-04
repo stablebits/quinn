@@ -1055,6 +1055,11 @@ fn poll_accept<'a>(
     mut notify: Pin<&mut Notified<'a>>,
     dir: Dir,
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
+    // Instrumentation: track total poll invocations
+    conn.shared
+        .accept_complete_poll_total
+        .fetch_add(1, Ordering::Relaxed);
+
     let mut state = conn.state.lock("poll_accept");
     // Check for incoming streams before checking `state.error` so that already-received streams,
     // which are necessarily finite, can be drained from a closed connection.
@@ -1062,6 +1067,10 @@ fn poll_accept<'a>(
         let is_0rtt = state.inner.is_handshaking();
         state.wake(); // To send additional stream ID credit
         drop(state); // Release the lock so clone can take it
+        // Instrumentation: track successful polls
+        conn.shared
+            .accept_complete_poll_success
+            .fetch_add(1, Ordering::Relaxed);
         return Poll::Ready(Ok((conn.clone(), id, is_0rtt)));
     } else if let Some(ref e) = state.error {
         return Poll::Ready(Err(e.clone()));
@@ -1069,7 +1078,13 @@ fn poll_accept<'a>(
     loop {
         match notify.as_mut().poll(ctx) {
             // `state` lock ensures we didn't race with readiness
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => {
+                // Instrumentation: track pending polls
+                conn.shared
+                    .accept_complete_poll_pending
+                    .fetch_add(1, Ordering::Relaxed);
+                return Poll::Pending;
+            }
             // Spurious wakeup, get a new future
             Poll::Ready(()) => notify.set(conn.shared.stream_incoming[dir as usize].notified()),
         }
@@ -1221,12 +1236,12 @@ pub(crate) struct Shared {
     closed: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
-    /// Instrumentation: total poll invocations for accept_any_complete_uni_with_data
-    accept_complete_poll_total: AtomicU64,
-    /// Instrumentation: successful poll invocations (returned a stream)
-    accept_complete_poll_success: AtomicU64,
+    /// Instrumentation: total poll invocations for accept/read operations
+    pub(crate) accept_complete_poll_total: AtomicU64,
+    /// Instrumentation: successful poll invocations (returned a stream or data)
+    pub(crate) accept_complete_poll_success: AtomicU64,
     /// Instrumentation: poll invocations that returned Pending
-    accept_complete_poll_pending: AtomicU64,
+    pub(crate) accept_complete_poll_pending: AtomicU64,
 }
 
 pub(crate) struct State {
