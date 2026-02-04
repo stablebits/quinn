@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker, ready},
 };
@@ -393,6 +393,18 @@ impl Connection {
             data,
             notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
             notify_complete: self.0.shared.complete_uni_stream.notified(),
+        }
+    }
+
+    /// Get instrumentation stats for `accept_any_complete_uni_with_data` poll behavior
+    ///
+    /// Returns counters tracking total polls, successful polls (returned a stream),
+    /// and pending polls (no stream available). Useful for diagnosing lock contention.
+    pub fn accept_complete_poll_stats(&self) -> AcceptCompletePollStats {
+        AcceptCompletePollStats {
+            total: self.0.shared.accept_complete_poll_total.load(Ordering::Relaxed),
+            success: self.0.shared.accept_complete_poll_success.load(Ordering::Relaxed),
+            pending: self.0.shared.accept_complete_poll_pending.load(Ordering::Relaxed),
         }
     }
 
@@ -881,6 +893,17 @@ impl Future for AcceptAnyCompleteUni<'_> {
     }
 }
 
+/// Instrumentation stats for `accept_any_complete_uni_with_data` poll behavior
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcceptCompletePollStats {
+    /// Total number of poll() invocations
+    pub total: u64,
+    /// Number of successful polls (returned a stream)
+    pub success: u64,
+    /// Number of polls that returned Pending (no stream available)
+    pub pending: u64,
+}
+
 /// Errors that can occur when accepting a finished uni stream and reading its data
 #[derive(Debug, Error, Clone)]
 pub enum AcceptAnyCompleteUniWithDataError {
@@ -914,6 +937,13 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+
+        // Instrumentation: track total poll invocations
+        this.conn
+            .shared
+            .accept_complete_poll_total
+            .fetch_add(1, Ordering::Relaxed);
+
         let mut state = this
             .conn
             .state
@@ -930,6 +960,11 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
                         e.clone(),
                     )));
                 }
+                // Instrumentation: track pending polls
+                this.conn
+                    .shared
+                    .accept_complete_poll_pending
+                    .fetch_add(1, Ordering::Relaxed);
                 return poll_accept_any_complete_uni_notifiers(
                     ctx,
                     this.conn,
@@ -976,6 +1011,13 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
         if should_transmit.should_transmit() {
             state.wake();
         }
+
+        // Instrumentation: track successful polls
+        this.conn
+            .shared
+            .accept_complete_poll_success
+            .fetch_add(1, Ordering::Relaxed);
+
         Poll::Ready(result)
     }
 }
@@ -1179,6 +1221,12 @@ pub(crate) struct Shared {
     closed: Notify,
     /// Number of live handles that can used to initiate or handle I/O; excludes the driver
     ref_count: AtomicUsize,
+    /// Instrumentation: total poll invocations for accept_any_complete_uni_with_data
+    accept_complete_poll_total: AtomicU64,
+    /// Instrumentation: successful poll invocations (returned a stream)
+    accept_complete_poll_success: AtomicU64,
+    /// Instrumentation: poll invocations that returned Pending
+    accept_complete_poll_pending: AtomicU64,
 }
 
 pub(crate) struct State {
