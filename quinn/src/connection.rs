@@ -904,51 +904,31 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
-        // Phase 1: Try to get a stream ID (release lock after to allow CD to interleave)
-        let id = {
-            let mut state = this
-                .conn
-                .state
-                .lock("poll_accept_any_complete_uni_with_data_phase1");
-
-            match state.inner.accept_complete_uni_id_only() {
-                Some(id) => id,
-                None => {
-                    // No complete stream available, check for errors
-                    if let Some(ref e) = state.error {
-                        return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(
-                            e.clone(),
-                        )));
-                    }
-                    return poll_accept_any_complete_uni_notifiers(
-                        ctx,
-                        this.conn,
-                        this.notify_incoming,
-                    );
-                }
-            }
-        }; // Lock released here - allows ConnectionDriver to interleave
-
-        // Phase 2: Take the Recv and read data
         let mut state = this
             .conn
             .state
-            .lock("poll_accept_any_complete_uni_with_data_phase2");
+            .lock("poll_accept_any_complete_uni_with_data");
 
+        // Check for finished streams before checking errors so that already-received streams
+        // can be drained from a closed connection.
+        // Use accept_uni_with_chunks to avoid redundant hash lookup
         let (result, should_transmit) = {
-            let Some(result) = state.inner.take_uni_recv_by_id(id, true) else {
-                // Stream was removed between phase 1 and 2 (connection closed?)
+            let Some(result) = state.inner.accept_uni_with_chunks(true) else {
+                // No complete stream available, check for errors
                 if let Some(ref e) = state.error {
                     return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(
                         e.clone(),
                     )));
                 }
-                // Shouldn't normally happen, but handle gracefully
-                unreachable!("stream {id} disappeared between phase 1 and 2");
+                return poll_accept_any_complete_uni_notifiers(
+                    ctx,
+                    this.conn,
+                    this.notify_incoming,
+                );
             };
 
-            let mut chunks = match result {
-                Ok(c) => c,
+            let (id, mut chunks) = match result {
+                Ok(v) => v,
                 Err(proto::ReadableError::ClosedStream) => {
                     unreachable!("complete stream should be readable");
                 }
@@ -973,7 +953,7 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
                         });
                     }
                     Err(proto::ReadError::Blocked) => {
-                        // Shouldn't happen for complete streams
+                        // Shouldn't happen for streams from accept_uni_with_chunks()
                         unreachable!("complete stream should be readable: {id}");
                     }
                 }
