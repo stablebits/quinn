@@ -947,6 +947,16 @@ impl StreamsState {
         Some(entry.remove()?.into_inner())
     }
 
+    /// Pop a complete uni stream ID without removing its Recv
+    pub(crate) fn pop_complete_uni_stream_id(&mut self) -> Option<StreamId> {
+        self.complete_uni_streams.pop_front()
+    }
+
+    /// Remove and return the Recv for a given stream ID
+    pub(crate) fn take_recv_by_id(&mut self, id: StreamId) -> Option<Box<Recv>> {
+        self.recv.remove(&id)?.map(|r| r.into_inner())
+    }
+
     /// Adds credits to the connection flow control window
     ///
     /// Returns whether a `MAX_DATA` frame should be enqueued as soon as possible.

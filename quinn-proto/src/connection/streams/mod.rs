@@ -116,6 +116,40 @@ impl<'a> Streams<'a> {
         None
     }
 
+    /// Try to get a complete uni stream ID only (without taking the Recv).
+    /// Returns the ID if found, or None if no complete stream is available.
+    pub(crate) fn accept_complete_uni_id_only(&mut self) -> Option<StreamId> {
+        // First check the complete queue
+        if let Some(id) = self.state.pop_complete_uni_stream_id() {
+            return Some(id);
+        }
+
+        // Check new streams
+        while let Some(id) = self.accept(Dir::Uni) {
+            let Some(recv) = self
+                .state
+                .recv
+                .get_mut(&id)
+                .and_then(|s| s.as_mut())
+                .and_then(|s| s.as_open_recv_mut())
+            else {
+                continue;
+            };
+
+            if recv.is_all_data_available() {
+                return Some(id);
+            }
+            // Not complete, mark for tracking
+            recv.tracked_for_completion = true;
+        }
+        None
+    }
+
+    /// Remove and return the Recv for a given stream ID
+    pub(crate) fn take_recv_by_id(&mut self, id: StreamId) -> Option<Box<Recv>> {
+        self.state.take_recv_by_id(id)
+    }
+
     /// Check if a stream has all its data available. If not, mark it for tracking
     /// so we get notified when it becomes complete.
     fn check_complete_or_track(&mut self, id: StreamId) -> bool {

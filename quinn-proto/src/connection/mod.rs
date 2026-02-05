@@ -446,6 +446,32 @@ impl Connection {
         Some(chunks.map(|c| (id, c)))
     }
 
+    /// Get just the stream ID of a complete uni stream (phase 1 of split accept)
+    ///
+    /// Returns `None` if there are no complete streams available.
+    pub fn accept_complete_uni_id_only(&mut self) -> Option<StreamId> {
+        self.streams().accept_complete_uni_id_only()
+    }
+
+    /// Take the Recv for a stream by ID and get its data reader (phase 2 of split accept)
+    ///
+    /// Returns `None` if the stream doesn't exist.
+    pub fn take_uni_recv_by_id(
+        &mut self,
+        id: StreamId,
+        ordered: bool,
+    ) -> Option<Result<Chunks<'_>, ReadableError>> {
+        let recv = self.streams.take_recv_by_id(id)?;
+        let chunks = Chunks::from_recv(
+            id,
+            ordered,
+            recv,
+            &mut self.streams,
+            &mut self.spaces[SpaceId::Data].pending,
+        );
+        Some(chunks)
+    }
+
     /// Provide control over streams
     #[must_use]
     pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
