@@ -580,14 +580,6 @@ pub enum StreamEvent {
         /// Directionality for which streams are newly available
         dir: Dir,
     },
-    /// At least one stream can be accepted with all its data (finished and fully buffered)
-    ///
-    /// This event is generated when a remote stream receives its final data,
-    /// allowing out-of-order processing via `accept_any_complete()`.
-    AcceptAnyComplete {
-        /// Directionality for which streams are available
-        dir: Dir,
-    },
 }
 
 /// Indicates whether a frame needs to be transmitted

@@ -13,8 +13,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use pin_project_lite::pin_project;
 use nohash_hasher::IntMap;
+use pin_project_lite::pin_project;
 use thiserror::Error;
 use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
 use tracing::{Instrument, Span, debug_span};
@@ -368,7 +368,6 @@ impl Connection {
         AcceptAnyCompleteUni {
             conn: &self.0,
             notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
-            notify_complete: self.0.shared.complete_uni_stream.notified(),
         }
     }
 
@@ -392,7 +391,6 @@ impl Connection {
             conn: &self.0,
             data,
             notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
-            notify_complete: self.0.shared.complete_uni_stream.notified(),
         }
     }
 
@@ -849,8 +847,6 @@ pin_project! {
         conn: &'a ConnectionRef,
         #[pin]
         notify_incoming: Notified<'a>,
-        #[pin]
-        notify_complete: Notified<'a>,
     }
 }
 
@@ -872,12 +868,7 @@ impl Future for AcceptAnyCompleteUni<'_> {
             return Poll::Ready(Err(e.clone()));
         }
 
-        poll_accept_any_complete_uni_notifiers(
-            ctx,
-            this.conn,
-            this.notify_incoming,
-            this.notify_complete,
-        )
+        poll_accept_any_complete_uni_notifiers(ctx, this.conn, this.notify_incoming)
     }
 }
 
@@ -904,8 +895,6 @@ pin_project! {
         data: &'a mut Vec<Bytes>,
         #[pin]
         notify_incoming: Notified<'a>,
-        #[pin]
-        notify_complete: Notified<'a>,
     }
 }
 
@@ -935,7 +924,6 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
                     ctx,
                     this.conn,
                     this.notify_incoming,
-                    this.notify_complete,
                 );
             };
 
@@ -987,25 +975,17 @@ fn poll_accept_any_complete_uni_notifiers<'a, T>(
     ctx: &mut Context<'_>,
     conn: &'a ConnectionRef,
     mut notify_incoming: Pin<&mut Notified<'a>>,
-    mut notify_complete: Pin<&mut Notified<'a>>,
 ) -> Poll<T> {
     loop {
         let incoming_ready = notify_incoming.as_mut().poll(ctx).is_ready();
-        let complete_ready = notify_complete.as_mut().poll(ctx).is_ready();
 
         // `state` lock ensures we didn't race with readiness
-        if !incoming_ready && !complete_ready {
+        if !incoming_ready {
             return Poll::Pending;
         }
 
         // Must be spurious wakeups.
-        if incoming_ready {
-            notify_incoming.set(conn.shared.stream_incoming[Dir::Uni as usize].notified());
-        }
-
-        if complete_ready {
-            notify_complete.set(conn.shared.complete_uni_stream.notified());
-        }
+        notify_incoming.set(conn.shared.stream_incoming[Dir::Uni as usize].notified());
     }
 }
 
@@ -1174,8 +1154,6 @@ pub(crate) struct Shared {
     stream_budget_available: [Notify; 2],
     /// Notified when the peer has initiated a new stream
     stream_incoming: [Notify; 2],
-    /// Notified when a uni stream has all its data available (finished and fully buffered)
-    complete_uni_stream: Notify,
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
@@ -1386,11 +1364,6 @@ impl State {
                     // Might mean any number of streams are ready, so we wake up everyone
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
-                Stream(StreamEvent::AcceptAnyComplete { dir }) => {
-                    if dir == Dir::Uni {
-                        shared.complete_uni_stream.notify_waiters();
-                    }
-                }
                 Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
                 Stream(StreamEvent::Stopped { id, .. }) => {
                     wake_stream_notify(id, &mut self.stopped);
@@ -1469,7 +1442,6 @@ impl State {
         shared.stream_budget_available[Dir::Bi as usize].notify_waiters();
         shared.stream_incoming[Dir::Uni as usize].notify_waiters();
         shared.stream_incoming[Dir::Bi as usize].notify_waiters();
-        shared.complete_uni_stream.notify_waiters();
         shared.datagram_received.notify_waiters();
         shared.datagrams_unblocked.notify_waiters();
         if let Some(x) = self.on_connected.take() {

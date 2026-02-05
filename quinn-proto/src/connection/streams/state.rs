@@ -801,7 +801,7 @@ impl StreamsState {
         }
 
         if mem::replace(&mut self.complete_uni_streams_available, false) {
-            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
+            return Some(StreamEvent::Opened { dir: Dir::Uni });
         }
 
         if self.write_limit() > 0 {
