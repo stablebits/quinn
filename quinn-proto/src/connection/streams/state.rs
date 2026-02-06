@@ -95,6 +95,11 @@ pub struct StreamsState {
     opened: [bool; 2],
     // Next to report to the application, once opened
     pub(super) next_reported_remote: [u64; 2],
+    /// Uni streams that have all their data available (finished and fully buffered).
+    /// Used by `accept_any_complete_uni()` to return streams out of order.
+    pub(super) complete_uni_streams: VecDeque<StreamId>,
+    /// Whether the application needs to be notified about available complete uni streams
+    complete_uni_streams_available: bool,
     /// Number of outbound streams
     ///
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
@@ -164,6 +169,8 @@ impl StreamsState {
             next_remote: [0, 0],
             opened: [false, false],
             next_reported_remote: [0, 0],
+            complete_uni_streams: VecDeque::new(),
+            complete_uni_streams_available: false,
             send_streams: 0,
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
@@ -279,6 +286,15 @@ impl StreamsState {
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
+            // Report complete streams for `accept_any_complete_uni()`
+            if id.dir() == Dir::Uni
+                && rs.tracked_for_completion
+                && rs.is_all_data_available()
+            {
+                self.complete_uni_streams_available = true;
+                self.complete_uni_streams.push_back(id);
+                rs.tracked_for_completion = false;
+            }
             self.on_stream_frame(true, id);
             return Ok(ShouldTransmit(false));
         }
@@ -332,10 +348,15 @@ impl StreamsState {
         let bytes_read = rs.assembler.bytes_read();
         let stopped = rs.stopped;
         let end = rs.end;
+        let was_incomplete =
+            id.dir() == Dir::Uni && std::mem::replace(&mut rs.tracked_for_completion, false);
         if stopped {
             // Stopped streams should be disposed immediately on reset
             let rs = self.recv.remove(&id).flatten().unwrap();
             self.stream_recv_freed(id, rs);
+        } else if was_incomplete {
+            self.complete_uni_streams_available = true;
+            self.complete_uni_streams.push_back(id);
         }
         self.on_stream_frame(!stopped, id);
 
@@ -758,6 +779,10 @@ impl StreamsState {
 
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
+        if mem::replace(&mut self.complete_uni_streams_available, false) {
+            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
+        }
+
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
         {
             return Some(StreamEvent::Opened { dir });
@@ -873,6 +898,37 @@ impl StreamsState {
             let recv = self.free_recv.pop();
             assert!(self.recv.insert(id, recv).is_none());
         }
+    }
+
+    /// Pop a complete uni stream and remove its Recv in one operation
+    ///
+    /// Returns the stream ID and its Recv, avoiding a separate hash lookup.
+    pub(crate) fn take_complete_uni_recv(&mut self) -> Option<(StreamId, Box<Recv>)> {
+        let id = self.complete_uni_streams.pop_front()?;
+        let recv = self.recv.remove(&id)??.into_inner();
+        Some((id, recv))
+    }
+
+    /// Take the Recv for a stream if it's complete, otherwise mark it for tracking
+    ///
+    /// Returns the Recv if the stream has all data available.
+    /// If not complete, marks the stream for completion tracking and returns None.
+    pub(super) fn take_recv_if_complete(&mut self, id: StreamId) -> Option<Box<Recv>> {
+        // Use entry API for single hash lookup
+        let mut entry = match self.recv.entry(id) {
+            hash_map::Entry::Occupied(e) => e,
+            hash_map::Entry::Vacant(_) => return None,
+        };
+
+        {
+            let recv = entry.get_mut().as_mut()?.as_open_recv_mut()?;
+            if !recv.is_all_data_available() {
+                recv.tracked_for_completion = true;
+                return None;
+            }
+        }
+
+        Some(entry.remove()?.into_inner())
     }
 
     /// Adds credits to the connection flow control window

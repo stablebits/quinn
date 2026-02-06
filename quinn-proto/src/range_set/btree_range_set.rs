@@ -92,6 +92,15 @@ impl RangeSet {
             .map(|(&x, &y)| (x, y))
     }
 
+    /// Check if the range [start, end) is fully contained in this set
+    pub(crate) fn contains_range(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return true;
+        }
+        self.pred(start)
+            .is_some_and(|(_, pred_end)| pred_end >= end)
+    }
+
     /// Find the closest range to `x` that begins after it
     fn succ(&self, x: u64) -> Option<(u64, u64)> {
         self.0

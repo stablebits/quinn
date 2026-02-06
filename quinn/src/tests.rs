@@ -170,6 +170,134 @@ fn read_after_close() {
     });
 }
 
+#[tokio::test]
+async fn accept_any_complete_uni_with_data_returns_complete_stream() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    const FAST: &[u8] = b"fast";
+    const SLOW_PART1: &[u8] = b"slow-";
+    const SLOW_PART2: &[u8] = b"stream";
+
+    let sender = async move {
+        let mut slow = server.open_uni().await.unwrap();
+        slow.write_all(SLOW_PART1).await.unwrap();
+        let mut fast = server.open_uni().await.unwrap();
+        fast.write_all(FAST).await.unwrap();
+        fast.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        slow.write_all(SLOW_PART2).await.unwrap();
+        slow.finish().unwrap();
+        _ = fast.stopped().await;
+        _ = slow.stopped().await;
+    };
+
+    let receiver = async move {
+        let mut data = Vec::with_capacity(4);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_any_complete_uni_with_data(&mut data),
+        )
+        .await
+        .expect("timeout waiting for first stream")
+        .expect("first stream");
+        let first = data.iter().fold(Vec::new(), |mut acc, b| {
+            acc.extend_from_slice(&b[..]);
+            acc
+        });
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_any_complete_uni_with_data(&mut data),
+        )
+        .await
+        .expect("timeout waiting for second stream")
+        .expect("second stream");
+        let second = data.iter().fold(Vec::new(), |mut acc, b| {
+            acc.extend_from_slice(&b[..]);
+            acc
+        });
+
+        assert_eq!(first, FAST);
+        let mut expected_slow = Vec::new();
+        expected_slow.extend_from_slice(SLOW_PART1);
+        expected_slow.extend_from_slice(SLOW_PART2);
+        assert_eq!(second, expected_slow);
+    };
+
+    tokio::join!(sender, receiver);
+}
+
+#[tokio::test]
+async fn accept_any_complete_uni_with_data_handles_reset_stream() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    const RESET_CODE: proto::VarInt = proto::VarInt::from_u32(42);
+
+    let sender = async move {
+        // Open stream 1 and send partial data (don't finish)
+        let mut stream1 = server.open_uni().await.unwrap();
+        stream1.write_all(b"partial").await.unwrap();
+
+        // Give receiver time to see stream1 as incomplete
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now reset stream1 instead of finishing it
+        stream1.reset(RESET_CODE).unwrap();
+        _ = stream1.stopped().await;
+    };
+
+    let receiver = async move {
+        let mut data = Vec::with_capacity(4);
+
+        // First call should trigger tracking of stream1 as incomplete (no complete streams yet)
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            client.accept_any_complete_uni_with_data(&mut data),
+        )
+        .await;
+        // Should timeout since stream1 is not complete
+        assert!(result.is_err(), "should timeout - no complete streams yet");
+
+        // Now wait for the reset to arrive and wake us up
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.accept_any_complete_uni_with_data(&mut data),
+        )
+        .await
+        .expect("should not timeout after reset");
+
+        // Should get a Reset error
+        match result {
+            Err(super::AcceptAnyCompleteUniWithDataError::Reset { error_code, .. }) => {
+                assert_eq!(error_code, RESET_CODE);
+            }
+            other => panic!("expected Reset error, got {:?}", other),
+        }
+    };
+
+    tokio::join!(sender, receiver);
+}
+
 #[test]
 fn export_keying_material() {
     let _guard = subscribe();
