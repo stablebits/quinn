@@ -293,6 +293,8 @@ impl From<StreamId> for u64 {
     }
 }
 
+impl nohash_hasher::IsEnabled for StreamId {}
+
 impl coding::Codec for StreamId {
     fn decode<B: bytes::Buf>(buf: &mut B) -> coding::Result<Self> {
         VarInt::decode(buf).map(|x| Self(x.into_inner()))

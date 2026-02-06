@@ -14,7 +14,7 @@ use std::{
 
 use bytes::Bytes;
 use pin_project_lite::pin_project;
-use rustc_hash::FxHashMap;
+use nohash_hasher::IntMap;
 use thiserror::Error;
 use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
 use tracing::{Instrument, Span, debug_span};
@@ -983,9 +983,9 @@ pub(crate) struct State {
     timer_deadline: Option<Instant>,
     conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
     endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-    pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
-    pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
-    pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
+    pub(crate) blocked_writers: IntMap<StreamId, Waker>,
+    pub(crate) blocked_readers: IntMap<StreamId, Waker>,
+    pub(crate) stopped: IntMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
     sender: Pin<Box<dyn UdpSender>>,
@@ -1019,9 +1019,9 @@ impl State {
             timer_deadline: None,
             conn_events,
             endpoint_events,
-            blocked_writers: FxHashMap::default(),
-            blocked_readers: FxHashMap::default(),
-            stopped: FxHashMap::default(),
+            blocked_writers: IntMap::default(),
+            blocked_readers: IntMap::default(),
+            stopped: IntMap::default(),
             error: None,
             sender,
             runtime,
@@ -1302,23 +1302,23 @@ impl fmt::Debug for State {
     }
 }
 
-fn wake_stream(stream_id: StreamId, wakers: &mut FxHashMap<StreamId, Waker>) {
+fn wake_stream(stream_id: StreamId, wakers: &mut IntMap<StreamId, Waker>) {
     if let Some(waker) = wakers.remove(&stream_id) {
         waker.wake();
     }
 }
 
-fn wake_all(wakers: &mut FxHashMap<StreamId, Waker>) {
+fn wake_all(wakers: &mut IntMap<StreamId, Waker>) {
     wakers.drain().for_each(|(_, waker)| waker.wake())
 }
 
-fn wake_stream_notify(stream_id: StreamId, wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
+fn wake_stream_notify(stream_id: StreamId, wakers: &mut IntMap<StreamId, Arc<Notify>>) {
     if let Some(notify) = wakers.remove(&stream_id) {
         notify.notify_waiters()
     }
 }
 
-fn wake_all_notify(wakers: &mut FxHashMap<StreamId, Arc<Notify>>) {
+fn wake_all_notify(wakers: &mut IntMap<StreamId, Arc<Notify>>) {
     wakers
         .drain()
         .for_each(|(_, notify)| notify.notify_waiters())
