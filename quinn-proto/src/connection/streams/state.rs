@@ -287,10 +287,7 @@ impl StreamsState {
 
         if !rs.stopped {
             // Report complete streams for `accept_complete_uni()`
-            if id.dir() == Dir::Uni
-                && rs.tracked_for_completion
-                && rs.is_all_data_available()
-            {
+            if id.dir() == Dir::Uni && rs.tracked_for_completion && rs.is_all_data_available() {
                 self.complete_uni_streams_available = true;
                 self.complete_uni_streams.push_back(id);
                 rs.tracked_for_completion = false;
@@ -922,7 +919,7 @@ impl StreamsState {
 
         {
             let recv = entry.get_mut().as_mut()?.as_open_recv_mut()?;
-            if !recv.is_all_data_available() {
+            if !recv.is_all_data_available() && recv.is_receiving() {
                 recv.tracked_for_completion = true;
                 return None;
             }
@@ -2133,5 +2130,42 @@ mod tests {
         // Assert that only `smaller_send_window` bytes are accepted
         assert_eq!(stream.write(&data), Ok(smaller_send_window as usize));
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+    }
+
+    #[test]
+    fn accept_complete_uni_returns_reset_stream() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+
+        // Receive partial data (no FIN)
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(b"partial"),
+                },
+                7,
+            )
+            .unwrap();
+
+        // Reset arrives before the app calls accept_complete_uni()
+        let _ = client
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 42u32.into(),
+                final_offset: 7u32.into(),
+            })
+            .unwrap();
+
+        // accept_complete_uni should return the reset stream
+        let conn_state = ConnState::Established;
+        let mut streams = Streams {
+            state: &mut client,
+            conn_state: &conn_state,
+        };
+        let accepted = streams.accept_complete_uni();
+        assert_eq!(accepted, Some(id));
     }
 }

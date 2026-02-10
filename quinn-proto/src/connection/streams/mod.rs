@@ -128,7 +128,7 @@ impl<'a> Streams<'a> {
             return false;
         };
 
-        if recv.is_all_data_available() {
+        if recv.is_all_data_available() || !recv.is_receiving() {
             true
         } else {
             recv.tracked_for_completion = true;
@@ -581,7 +581,7 @@ pub enum StreamEvent {
     },
     /// At least one stream can be accepted with all its data (finished and fully buffered)
     ///
-    /// This event is generated when a remote stream receives its final data,
+    /// This event is generated when a remotely initiated stream receives its final data,
     /// allowing out-of-order processing via `accept_complete()`.
     AcceptComplete {
         /// Directionality for which streams are available
