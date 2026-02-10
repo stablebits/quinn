@@ -364,8 +364,8 @@ impl Connection {
     /// **Note**: This function internally drains the pending stream queue while searching
     /// for complete streams. Use it instead of [`accept_uni`](Self::accept_uni), not together
     /// with it.
-    pub fn accept_any_complete_uni(&self) -> AcceptAnyCompleteUni<'_> {
-        AcceptAnyCompleteUni {
+    pub fn accept_complete_uni(&self) -> AcceptCompleteUni<'_> {
+        AcceptCompleteUni {
             conn: &self.0,
             notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
             notify_complete: self.0.shared.complete_uni_stream.notified(),
@@ -374,7 +374,7 @@ impl Connection {
 
     /// Accept any complete unidirectional stream and read its data in a single operation
     ///
-    /// This is more efficient than [`accept_any_complete_uni`](Self::accept_any_complete_uni)
+    /// This is more efficient than [`accept_complete_uni`](Self::accept_complete_uni)
     /// followed by reading the stream, as it acquires the connection lock only once.
     ///
     /// The `data` Vec is cleared and filled with the stream's chunks. Pre-allocate with
@@ -383,12 +383,12 @@ impl Connection {
     ///
     /// This is ideal for processing many small, independent unidirectional streams
     /// where ordering doesn't matter and you want to minimize lock contention.
-    pub fn accept_any_complete_uni_with_data<'a>(
+    pub fn accept_complete_uni_with_data<'a>(
         &'a self,
         data: &'a mut Vec<Bytes>,
-    ) -> AcceptAnyCompleteUniWithData<'a> {
+    ) -> AcceptCompleteUniWithData<'a> {
         data.clear();
-        AcceptAnyCompleteUniWithData {
+        AcceptCompleteUniWithData {
             conn: &self.0,
             data,
             notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
@@ -844,8 +844,8 @@ impl Future for AcceptBi<'_> {
 }
 
 pin_project! {
-    /// Future produced by [`Connection::accept_any_complete_uni`]
-    pub struct AcceptAnyCompleteUni<'a> {
+    /// Future produced by [`Connection::accept_complete_uni`]
+    pub struct AcceptCompleteUni<'a> {
         conn: &'a ConnectionRef,
         #[pin]
         notify_incoming: Notified<'a>,
@@ -854,16 +854,16 @@ pin_project! {
     }
 }
 
-impl Future for AcceptAnyCompleteUni<'_> {
+impl Future for AcceptCompleteUni<'_> {
     type Output = Result<RecvStream, ConnectionError>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        let mut state = this.conn.state.lock("poll_accept_any_complete_uni");
+        let mut state = this.conn.state.lock("poll_accept_complete_uni");
 
         // Check for complete streams before checking errors so that already-received streams
         // can be drained from a closed connection.
-        if let Some(id) = state.inner.streams().accept_any_complete_uni() {
+        if let Some(id) = state.inner.streams().accept_complete_uni() {
             let is_0rtt = state.inner.is_handshaking();
             state.wake(); // To send additional stream ID credit
             drop(state); // Release the lock so clone can take it
@@ -872,7 +872,7 @@ impl Future for AcceptAnyCompleteUni<'_> {
             return Poll::Ready(Err(e.clone()));
         }
 
-        poll_accept_any_complete_uni_notifiers(
+        poll_accept_complete_uni_notifiers(
             ctx,
             this.conn,
             this.notify_incoming,
@@ -883,7 +883,7 @@ impl Future for AcceptAnyCompleteUni<'_> {
 
 /// Errors that can occur when accepting a finished uni stream and reading its data
 #[derive(Debug, Error, Clone)]
-pub enum AcceptAnyCompleteUniWithDataError {
+pub enum AcceptCompleteUniWithDataError {
     /// The connection was lost
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
@@ -898,8 +898,8 @@ pub enum AcceptAnyCompleteUniWithDataError {
 }
 
 pin_project! {
-    /// Future produced by [`Connection::accept_any_complete_uni_with_data`]
-    pub struct AcceptAnyCompleteUniWithData<'a> {
+    /// Future produced by [`Connection::accept_complete_uni_with_data`]
+    pub struct AcceptCompleteUniWithData<'a> {
         conn: &'a ConnectionRef,
         data: &'a mut Vec<Bytes>,
         #[pin]
@@ -909,15 +909,15 @@ pin_project! {
     }
 }
 
-impl Future for AcceptAnyCompleteUniWithData<'_> {
-    type Output = Result<StreamId, AcceptAnyCompleteUniWithDataError>;
+impl Future for AcceptCompleteUniWithData<'_> {
+    type Output = Result<StreamId, AcceptCompleteUniWithDataError>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let mut state = this
             .conn
             .state
-            .lock("poll_accept_any_complete_uni_with_data");
+            .lock("poll_accept_complete_uni_with_data");
 
         // Check for finished streams before checking errors so that already-received streams
         // can be drained from a closed connection.
@@ -926,11 +926,11 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
             let Some(result) = state.inner.accept_uni_with_chunks(true) else {
                 // No complete stream available, check for errors
                 if let Some(ref e) = state.error {
-                    return Poll::Ready(Err(AcceptAnyCompleteUniWithDataError::ConnectionLost(
+                    return Poll::Ready(Err(AcceptCompleteUniWithDataError::ConnectionLost(
                         e.clone(),
                     )));
                 }
-                return poll_accept_any_complete_uni_notifiers(
+                return poll_accept_complete_uni_notifiers(
                     ctx,
                     this.conn,
                     this.notify_incoming,
@@ -958,7 +958,7 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
                         break Ok(id);
                     }
                     Err(proto::ReadError::Reset(code)) => {
-                        break Err(AcceptAnyCompleteUniWithDataError::Reset {
+                        break Err(AcceptCompleteUniWithDataError::Reset {
                             stream_id: id,
                             error_code: code,
                         });
@@ -980,8 +980,8 @@ impl Future for AcceptAnyCompleteUniWithData<'_> {
     }
 }
 
-/// Poll notifiers for `accept_any_complete_uni` variants, handling spurious wakeups.
-fn poll_accept_any_complete_uni_notifiers<'a, T>(
+/// Poll notifiers for `accept_complete_uni` variants, handling spurious wakeups.
+fn poll_accept_complete_uni_notifiers<'a, T>(
     ctx: &mut Context<'_>,
     conn: &'a ConnectionRef,
     mut notify_incoming: Pin<&mut Notified<'a>>,
@@ -1384,7 +1384,7 @@ impl State {
                     // Might mean any number of streams are ready, so we wake up everyone
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
-                Stream(StreamEvent::AcceptAnyComplete { dir }) => {
+                Stream(StreamEvent::AcceptComplete { dir }) => {
                     if dir == Dir::Uni {
                         shared.complete_uni_stream.notify_waiters();
                     }

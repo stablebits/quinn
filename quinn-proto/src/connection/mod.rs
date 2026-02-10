@@ -435,7 +435,7 @@ impl Connection {
         &mut self,
         ordered: bool,
     ) -> Option<Result<(StreamId, Chunks<'_>), ReadableError>> {
-        let (id, recv) = self.streams().accept_any_complete_uni_recv()?;
+        let (id, recv) = self.streams().accept_complete_uni_recv()?;
         let chunks = Chunks::from_recv(
             id,
             ordered,

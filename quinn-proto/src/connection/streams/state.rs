@@ -96,7 +96,7 @@ pub struct StreamsState {
     // Next to report to the application, once opened
     pub(super) next_reported_remote: [u64; 2],
     /// Uni streams that have all their data available (finished and fully buffered).
-    /// Used by `accept_any_complete_uni()` to return streams out of order.
+    /// Used by `accept_complete_uni()` to return streams out of order.
     pub(super) complete_uni_streams: VecDeque<StreamId>,
     /// Whether the application needs to be notified about available complete uni streams
     complete_uni_streams_available: bool,
@@ -286,7 +286,7 @@ impl StreamsState {
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
-            // Report complete streams for `accept_any_complete_uni()`
+            // Report complete streams for `accept_complete_uni()`
             if id.dir() == Dir::Uni
                 && rs.tracked_for_completion
                 && rs.is_all_data_available()
@@ -780,7 +780,7 @@ impl StreamsState {
     /// Yield stream events
     pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
         if mem::replace(&mut self.complete_uni_streams_available, false) {
-            return Some(StreamEvent::AcceptAnyComplete { dir: Dir::Uni });
+            return Some(StreamEvent::AcceptComplete { dir: Dir::Uni });
         }
 
         if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))

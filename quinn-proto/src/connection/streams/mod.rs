@@ -80,13 +80,12 @@ impl<'a> Streams<'a> {
 
     /// Accept any remotely initiated unidirectional stream that has all its data available
     ///
-    /// Unlike [`accept`](Self::accept), this returns streams out of order, and only these
+    /// Unlike [`accept`](Self::accept), this returns streams out of order, and only those
     /// that are already finished and have all their data buffered.
-    /// Note that this function consumes pending accepts for new streams while searching
-    /// for a complete one.
+    /// Note that this function accepts new streams while searching for a complete one.
     ///
     /// Returns `None` if there are no suitable streams.
-    pub fn accept_any_complete_uni(&mut self) -> Option<StreamId> {
+    pub fn accept_complete_uni(&mut self) -> Option<StreamId> {
         // First check if any previously incomplete stream has become complete
         self.state.complete_uni_streams.pop_front().or_else(|| {
             // If no, check new streams
@@ -99,9 +98,9 @@ impl<'a> Streams<'a> {
         })
     }
 
-    /// Like [`accept_any_complete_uni`](Self::accept_any_complete_uni), but also removes and
+    /// Like [`accept_complete_uni`](Self::accept_complete_uni), but also removes and
     /// returns the stream's Recv in one operation, avoiding a separate hash lookup.
-    pub(crate) fn accept_any_complete_uni_recv(&mut self) -> Option<(StreamId, Box<Recv>)> {
+    pub(crate) fn accept_complete_uni_recv(&mut self) -> Option<(StreamId, Box<Recv>)> {
         // First check the complete queue
         if let Some(result) = self.state.take_complete_uni_recv() {
             return Some(result);
@@ -583,8 +582,8 @@ pub enum StreamEvent {
     /// At least one stream can be accepted with all its data (finished and fully buffered)
     ///
     /// This event is generated when a remote stream receives its final data,
-    /// allowing out-of-order processing via `accept_any_complete()`.
-    AcceptAnyComplete {
+    /// allowing out-of-order processing via `accept_complete()`.
+    AcceptComplete {
         /// Directionality for which streams are available
         dir: Dir,
     },

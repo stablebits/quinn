@@ -171,7 +171,7 @@ fn read_after_close() {
 }
 
 #[tokio::test]
-async fn accept_any_complete_uni_with_data_returns_complete_stream() {
+async fn accept_complete_uni_with_data_returns_complete_stream() {
     let _guard = subscribe();
     let endpoint = endpoint();
 
@@ -205,7 +205,7 @@ async fn accept_any_complete_uni_with_data_returns_complete_stream() {
         let mut data = Vec::with_capacity(4);
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
-            client.accept_any_complete_uni_with_data(&mut data),
+            client.accept_complete_uni_with_data(&mut data),
         )
         .await
         .expect("timeout waiting for first stream")
@@ -217,7 +217,7 @@ async fn accept_any_complete_uni_with_data_returns_complete_stream() {
 
         let _ = tokio::time::timeout(
             Duration::from_secs(1),
-            client.accept_any_complete_uni_with_data(&mut data),
+            client.accept_complete_uni_with_data(&mut data),
         )
         .await
         .expect("timeout waiting for second stream")
@@ -238,7 +238,7 @@ async fn accept_any_complete_uni_with_data_returns_complete_stream() {
 }
 
 #[tokio::test]
-async fn accept_any_complete_uni_with_data_handles_reset_stream() {
+async fn accept_complete_uni_with_data_handles_reset_stream() {
     let _guard = subscribe();
     let endpoint = endpoint();
 
@@ -272,7 +272,7 @@ async fn accept_any_complete_uni_with_data_handles_reset_stream() {
         // First call should trigger tracking of stream1 as incomplete (no complete streams yet)
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            client.accept_any_complete_uni_with_data(&mut data),
+            client.accept_complete_uni_with_data(&mut data),
         )
         .await;
         // Should timeout since stream1 is not complete
@@ -281,14 +281,14 @@ async fn accept_any_complete_uni_with_data_handles_reset_stream() {
         // Now wait for the reset to arrive and wake us up
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            client.accept_any_complete_uni_with_data(&mut data),
+            client.accept_complete_uni_with_data(&mut data),
         )
         .await
         .expect("should not timeout after reset");
 
         // Should get a Reset error
         match result {
-            Err(super::AcceptAnyCompleteUniWithDataError::Reset { error_code, .. }) => {
+            Err(super::AcceptCompleteUniWithDataError::Reset { error_code, .. }) => {
                 assert_eq!(error_code, RESET_CODE);
             }
             other => panic!("expected Reset error, got {:?}", other),
