@@ -84,8 +84,8 @@ pub use streams::StreamsState;
 #[cfg(not(fuzzing))]
 use streams::StreamsState;
 pub use streams::{
-    Chunks, ClosedStream, FinishError, ReadError, ReadableError, RecvStream, SendStream,
-    ShouldTransmit, StreamEvent, Streams, WriteError, Written,
+    Chunks, ClosedStream, FinishError, ReadError, ReadToEndError, ReadableError, RecvStream,
+    SendStream, ShouldTransmit, StreamEvent, Streams, WriteError, Written,
 };
 
 mod timer;
@@ -426,6 +426,24 @@ impl Connection {
             state: &mut self.streams,
             pending: &mut self.spaces[SpaceId::Data].pending,
         }
+    }
+
+    /// Accept a complete unidirectional stream and get its data reader in one operation
+    ///
+    /// Returns `None` if there are no complete streams available.
+    pub fn accept_uni_with_chunks(
+        &mut self,
+        ordered: bool,
+    ) -> Option<Result<(StreamId, Chunks<'_>), ReadableError>> {
+        let (id, recv) = self.streams().accept_complete_uni_recv()?;
+        let chunks = Chunks::from_recv(
+            id,
+            ordered,
+            recv,
+            &mut self.streams,
+            &mut self.spaces[SpaceId::Data].pending,
+        );
+        Some(chunks.map(|c| (id, c)))
     }
 
     /// Provide control over streams

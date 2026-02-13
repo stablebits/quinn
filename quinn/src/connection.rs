@@ -352,6 +352,50 @@ impl Connection {
         }
     }
 
+    /// Accept any incoming unidirectional stream that has all its data available
+    ///
+    /// Unlike [`accept_uni`](Self::accept_uni), this returns streams out of order, and only
+    /// these that are already finished and have all their data buffered.
+    /// Waits until a complete stream is avaialble.
+    ///
+    /// This is particularly useful for applications that process many small, independent
+    /// unidirectional streams where the order of processing doesn't matter.
+    ///
+    /// **Note**: This function internally drains the pending stream queue while searching
+    /// for complete streams. Use it instead of [`accept_uni`](Self::accept_uni), not together
+    /// with it.
+    pub fn accept_complete_uni(&self) -> AcceptCompleteUni<'_> {
+        AcceptCompleteUni {
+            conn: &self.0,
+            notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
+            notify_complete: self.0.shared.complete_uni_stream.notified(),
+        }
+    }
+
+    /// Accept any complete unidirectional stream and read its data in a single operation
+    ///
+    /// This is more efficient than [`accept_complete_uni`](Self::accept_complete_uni)
+    /// followed by reading the stream, as it acquires the connection lock only once.
+    ///
+    /// The `data` Vec is cleared and filled with the stream's chunks. Pre-allocate with
+    /// sufficient capacity to avoid allocations in the common case. Returns the `StreamId`
+    /// on success.
+    ///
+    /// This is ideal for processing many small, independent unidirectional streams
+    /// where ordering doesn't matter and you want to minimize lock contention.
+    pub fn accept_complete_uni_with_data<'a>(
+        &'a self,
+        data: &'a mut Vec<Bytes>,
+    ) -> AcceptCompleteUniWithData<'a> {
+        data.clear();
+        AcceptCompleteUniWithData {
+            conn: &self.0,
+            data,
+            notify_incoming: self.0.shared.stream_incoming[Dir::Uni as usize].notified(),
+            notify_complete: self.0.shared.complete_uni_stream.notified(),
+        }
+    }
+
     /// Receive an application datagram
     pub fn read_datagram(&self) -> ReadDatagram<'_> {
         ReadDatagram {
@@ -799,6 +843,170 @@ impl Future for AcceptBi<'_> {
     }
 }
 
+pin_project! {
+    /// Future produced by [`Connection::accept_complete_uni`]
+    pub struct AcceptCompleteUni<'a> {
+        conn: &'a ConnectionRef,
+        #[pin]
+        notify_incoming: Notified<'a>,
+        #[pin]
+        notify_complete: Notified<'a>,
+    }
+}
+
+impl Future for AcceptCompleteUni<'_> {
+    type Output = Result<RecvStream, ConnectionError>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut state = this.conn.state.lock("poll_accept_complete_uni");
+
+        // Check for complete streams before checking errors so that already-received streams
+        // can be drained from a closed connection.
+        if let Some(id) = state.inner.streams().accept_complete_uni() {
+            let is_0rtt = state.inner.is_handshaking();
+            state.wake(); // To send additional stream ID credit
+            drop(state); // Release the lock so clone can take it
+            return Poll::Ready(Ok(RecvStream::new(this.conn.clone(), id, is_0rtt)));
+        } else if let Some(ref e) = state.error {
+            return Poll::Ready(Err(e.clone()));
+        }
+
+        poll_accept_complete_uni_notifiers(
+            ctx,
+            this.conn,
+            this.notify_incoming,
+            this.notify_complete,
+        )
+    }
+}
+
+/// Errors that can occur when accepting a finished uni stream and reading its data
+#[derive(Debug, Error, Clone)]
+pub enum AcceptCompleteUniWithDataError {
+    /// The connection was lost
+    #[error("connection lost")]
+    ConnectionLost(#[from] ConnectionError),
+    /// The stream was reset by the peer
+    #[error("stream {stream_id} was reset with error code {error_code}")]
+    Reset {
+        /// The stream that was reset
+        stream_id: StreamId,
+        /// The error code from the peer
+        error_code: VarInt,
+    },
+}
+
+pin_project! {
+    /// Future produced by [`Connection::accept_complete_uni_with_data`]
+    pub struct AcceptCompleteUniWithData<'a> {
+        conn: &'a ConnectionRef,
+        data: &'a mut Vec<Bytes>,
+        #[pin]
+        notify_incoming: Notified<'a>,
+        #[pin]
+        notify_complete: Notified<'a>,
+    }
+}
+
+impl Future for AcceptCompleteUniWithData<'_> {
+    type Output = Result<StreamId, AcceptCompleteUniWithDataError>;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut state = this
+            .conn
+            .state
+            .lock("poll_accept_complete_uni_with_data");
+
+        // Check for finished streams before checking errors so that already-received streams
+        // can be drained from a closed connection.
+        // Use accept_uni_with_chunks to avoid redundant hash lookup
+        let (result, should_transmit) = {
+            let Some(result) = state.inner.accept_uni_with_chunks(true) else {
+                // No complete stream available, check for errors
+                if let Some(ref e) = state.error {
+                    return Poll::Ready(Err(AcceptCompleteUniWithDataError::ConnectionLost(
+                        e.clone(),
+                    )));
+                }
+                return poll_accept_complete_uni_notifiers(
+                    ctx,
+                    this.conn,
+                    this.notify_incoming,
+                    this.notify_complete,
+                );
+            };
+
+            let (id, mut chunks) = match result {
+                Ok(v) => v,
+                Err(proto::ReadableError::ClosedStream) => {
+                    unreachable!("complete stream should be readable");
+                }
+                Err(proto::ReadableError::IllegalOrderedRead) => {
+                    unreachable!("ordered=false should not cause IllegalOrderedRead");
+                }
+            };
+
+            // Read all data from the stream
+            let result = loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => {
+                        this.data.push(chunk.bytes);
+                    }
+                    Ok(None) => {
+                        break Ok(id);
+                    }
+                    Err(proto::ReadError::Reset(code)) => {
+                        break Err(AcceptCompleteUniWithDataError::Reset {
+                            stream_id: id,
+                            error_code: code,
+                        });
+                    }
+                    Err(proto::ReadError::Blocked) => {
+                        // Shouldn't happen for streams from accept_uni_with_chunks()
+                        unreachable!("complete stream should be readable: {id}");
+                    }
+                }
+            };
+            let should_transmit = chunks.finalize();
+            (result, should_transmit)
+        };
+
+        if should_transmit.should_transmit() {
+            state.wake();
+        }
+        Poll::Ready(result)
+    }
+}
+
+/// Poll notifiers for `accept_complete_uni` variants, handling spurious wakeups.
+fn poll_accept_complete_uni_notifiers<'a, T>(
+    ctx: &mut Context<'_>,
+    conn: &'a ConnectionRef,
+    mut notify_incoming: Pin<&mut Notified<'a>>,
+    mut notify_complete: Pin<&mut Notified<'a>>,
+) -> Poll<T> {
+    loop {
+        let incoming_ready = notify_incoming.as_mut().poll(ctx).is_ready();
+        let complete_ready = notify_complete.as_mut().poll(ctx).is_ready();
+
+        // `state` lock ensures we didn't race with readiness
+        if !incoming_ready && !complete_ready {
+            return Poll::Pending;
+        }
+
+        // Must be spurious wakeups.
+        if incoming_ready {
+            notify_incoming.set(conn.shared.stream_incoming[Dir::Uni as usize].notified());
+        }
+
+        if complete_ready {
+            notify_complete.set(conn.shared.complete_uni_stream.notified());
+        }
+    }
+}
+
 fn poll_accept<'a>(
     ctx: &mut Context<'_>,
     conn: &'a ConnectionRef,
@@ -964,6 +1172,8 @@ pub(crate) struct Shared {
     stream_budget_available: [Notify; 2],
     /// Notified when the peer has initiated a new stream
     stream_incoming: [Notify; 2],
+    /// Notified when a uni stream has all its data available (finished and fully buffered)
+    complete_uni_stream: Notify,
     datagram_received: Notify,
     datagrams_unblocked: Notify,
     closed: Notify,
@@ -1174,6 +1384,11 @@ impl State {
                     // Might mean any number of streams are ready, so we wake up everyone
                     shared.stream_budget_available[dir as usize].notify_waiters();
                 }
+                Stream(StreamEvent::AcceptComplete { dir }) => {
+                    if dir == Dir::Uni {
+                        shared.complete_uni_stream.notify_waiters();
+                    }
+                }
                 Stream(StreamEvent::Finished { id }) => wake_stream_notify(id, &mut self.stopped),
                 Stream(StreamEvent::Stopped { id, .. }) => {
                     wake_stream_notify(id, &mut self.stopped);
@@ -1252,6 +1467,7 @@ impl State {
         shared.stream_budget_available[Dir::Bi as usize].notify_waiters();
         shared.stream_incoming[Dir::Uni as usize].notify_waiters();
         shared.stream_incoming[Dir::Bi as usize].notify_waiters();
+        shared.complete_uni_stream.notify_waiters();
         shared.datagram_received.notify_waiters();
         shared.datagrams_unblocked.notify_waiters();
         if let Some(x) = self.on_connected.take() {

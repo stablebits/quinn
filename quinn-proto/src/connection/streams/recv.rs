@@ -11,13 +11,16 @@ use crate::connection::streams::state::StreamRecv;
 use crate::{TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
-pub(super) struct Recv {
+pub(crate) struct Recv {
     // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
     pub(super) assembler: Assembler,
     sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    /// Whether this stream is being tracked by `accept_complete_uni()`.
+    /// Set when the stream is accepted but not yet complete, cleared when it becomes complete.
+    pub(super) tracked_for_completion: bool,
 }
 
 impl Recv {
@@ -28,6 +31,7 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            tracked_for_completion: false,
         })
     }
 
@@ -38,6 +42,7 @@ impl Recv {
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
         self.stopped = false;
+        self.tracked_for_completion = false;
     }
 
     /// Process a STREAM frame
@@ -163,6 +168,14 @@ impl Recv {
         }
     }
 
+    /// Check if all stream data is available (stream is finished and all data is buffered)
+    pub(super) fn is_all_data_available(&self) -> bool {
+        match self.final_offset() {
+            Some(final_offset) => self.assembler.is_all_data_available(final_offset),
+            None => false,
+        }
+    }
+
     /// Returns `false` iff the reset was redundant
     pub(super) fn reset(
         &mut self,
@@ -252,7 +265,7 @@ pub struct Chunks<'a> {
 }
 
 impl<'a> Chunks<'a> {
-    pub(super) fn new(
+    pub(crate) fn new(
         id: StreamId,
         ordered: bool,
         streams: &'a mut StreamsState,
@@ -269,6 +282,30 @@ impl<'a> Chunks<'a> {
                 false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
             };
 
+        recv.assembler.ensure_ordering(ordered)?;
+        Ok(Self {
+            id,
+            ordered,
+            streams,
+            pending,
+            state: ChunksState::Readable(recv),
+            read: 0,
+        })
+    }
+
+    /// Create Chunks from an already-removed Recv
+    ///
+    /// This avoids the hash lookup in `new()` when the caller already has the Recv.
+    pub(crate) fn from_recv(
+        id: StreamId,
+        ordered: bool,
+        mut recv: Box<Recv>,
+        streams: &'a mut StreamsState,
+        pending: &'a mut Retransmits,
+    ) -> Result<Self, ReadableError> {
+        if recv.stopped {
+            return Err(ReadableError::ClosedStream);
+        }
         recv.assembler.ensure_ordering(ordered)?;
         Ok(Self {
             id,
@@ -426,6 +463,17 @@ impl From<IllegalOrderedRead> for ReadableError {
     fn from(_: IllegalOrderedRead) -> Self {
         Self::IllegalOrderedRead
     }
+}
+
+/// Errors triggered by [`RecvStream::read_to_end`](super::RecvStream::read_to_end)
+#[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ReadToEndError {
+    /// Error opening the stream for reading
+    #[error(transparent)]
+    Readable(#[from] ReadableError),
+    /// Error while reading chunks
+    #[error(transparent)]
+    Read(#[from] ReadError),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
