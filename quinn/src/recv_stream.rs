@@ -217,7 +217,7 @@ impl RecvStream {
     }
 
     /// Foundation of [`Self::read_chunks`]
-    fn poll_read_chunks(
+    pub fn poll_read_chunks(
         &mut self,
         cx: &mut Context<'_>,
         bufs: &mut [Bytes],
