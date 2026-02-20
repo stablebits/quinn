@@ -415,8 +415,7 @@ mod tests {
 
         let bytes_to_send = capacity + mtu as u64;
 
-        let expected_delay_nanos =
-            bytes_to_send as u128 * 1_000_000_000 / pacing_rate as u128;
+        let expected_delay_nanos = bytes_to_send as u128 * 1_000_000_000 / pacing_rate as u128;
         let expected_delay = Duration::from_nanos(expected_delay_nanos as u64);
 
         let actual_delay = pacer
@@ -430,8 +429,7 @@ mod tests {
             "expected ≈ {expected_delay:?}, got {actual_delay:?} (diff {diff:?})"
         );
 
-        let burst_delay_nanos =
-            capacity as u128 * 1_000_000_000 / pacing_rate as u128;
+        let burst_delay_nanos = capacity as u128 * 1_000_000_000 / pacing_rate as u128;
         let burst_delay = Duration::from_nanos(burst_delay_nanos as u64);
         assert!(
             actual_delay > burst_delay,
