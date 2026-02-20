@@ -788,9 +788,10 @@ impl Default for MtuDiscoveryConfig {
 pub struct IdleTimeout(VarInt);
 
 /// Controls how the pacing rate is calculated
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum PacingRateMode {
     /// The pacing rate scales with the congestion window and inversely with RTT.
+    #[default]
     RttDependent,
 
     /// Fixed rate in bytes per second. Useful for latency-sensitive applications.
@@ -799,12 +800,6 @@ pub enum PacingRateMode {
     /// Rate = max(floor, RttDependent)
     /// Like `RttDependent`, but with a minimum rate floor (in bytes per second).
     RttDependentWithFloor(u64),
-}
-
-impl Default for PacingRateMode {
-    fn default() -> Self {
-        Self::RttDependent
-    }
 }
 
 /// Configuration for packet pacing
