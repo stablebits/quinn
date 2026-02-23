@@ -373,9 +373,13 @@ struct PendingStreamsQueue {
     /// The next stream to write out. This is `Some` when `TransportConfig::send_fairness(false)` and writing a stream is
     /// interrupted while the stream still has some pending data. See `reinsert_pending()`.
     next: Option<PendingStream>,
-    /// A monotonically decreasing counter, used to implement round-robin scheduling for streams of the same priority.
-    /// Underflowing is not a practical concern, as it is initialized to u64::MAX and only decremented by 1 in `push_pending`
+    /// A monotonically decreasing counter for new stream data, occupying the lower half of the u64 space
+    /// [0, u64::MAX/2]. Underflowing is not a practical concern.
     recency: u64,
+    /// A monotonically decreasing counter for retransmitted stream data, occupying the upper half of the
+    /// u64 space (u64::MAX/2, u64::MAX]. This keeps retransmit streams ahead of new-data streams of the
+    /// same priority in the queue, ensuring lost data is resent before new streams consume the window.
+    retransmit_recency: u64,
 }
 
 impl PendingStreamsQueue {
@@ -383,7 +387,8 @@ impl PendingStreamsQueue {
         Self {
             streams: BinaryHeap::new(),
             next: None,
-            recency: u64::MAX,
+            recency: u64::MAX / 2,
+            retransmit_recency: u64::MAX,
         }
     }
 
@@ -412,6 +417,19 @@ impl PendingStreamsQueue {
         self.streams.push(PendingStream {
             priority,
             recency: self.recency,
+            id,
+        });
+    }
+
+    /// Push a stream with retransmit data ahead of all new-data streams of the same priority.
+    ///
+    /// Uses a separate recency counter in the upper half of the u64 space, guaranteeing that
+    /// retransmit streams always sort above streams queued via `push_pending`.
+    fn push_pending_retransmit(&mut self, id: StreamId, priority: i32) {
+        self.retransmit_recency -= 1;
+        self.streams.push(PendingStream {
+            priority,
+            recency: self.retransmit_recency,
             id,
         });
     }

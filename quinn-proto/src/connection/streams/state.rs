@@ -657,7 +657,7 @@ impl StreamsState {
             return;
         };
         if !stream.is_pending() {
-            self.pending.push_pending(frame.id, stream.priority);
+            self.pending.push_pending_retransmit(frame.id, stream.priority);
         }
         stream.fin_pending |= frame.fin;
         stream.pending.retransmit(frame.offsets);
