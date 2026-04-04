@@ -447,23 +447,49 @@ impl EndpointInner {
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<Connecting, ConnectionError> {
-        let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
-        let now = state.runtime.now();
-        match state
-            .inner
-            .accept(incoming, now, &mut response_buffer, server_config)
-        {
-            Ok((handle, conn)) => {
+
+        // Phase 1: acquire lock, do the minimum work that needs endpoint state.
+        let (accepting, udp_sender, runtime) = {
+            let mut state = self.state.lock().unwrap();
+            let now = state.runtime.now();
+            match state
+                .inner
+                .start_accept(incoming, now, &mut response_buffer, server_config)
+            {
+                Ok(accepting) => {
+                    let udp_sender = state.socket.create_sender();
+                    let runtime = state.runtime.clone();
+                    (accepting, udp_sender, runtime)
+                }
+                Err(error) => {
+                    if let Some(transmit) = error.response {
+                        respond(transmit, &response_buffer, &mut state.sender);
+                    }
+                    return Err(error.cause);
+                }
+            }
+            // lock dropped here
+        };
+
+        // Phase 2: process first packet and buffered datagrams WITHOUT holding the lock.
+        // The happy path (handle_first_packet succeeds) doesn't need endpoint state.
+        // Only the error cleanup path requires re-acquiring the lock.
+        match accepting.finish_without_endpoint() {
+            Ok((handle, conn, accepting_idx)) => {
+                let mut state = self.state.lock().unwrap();
                 state.stats.accepted_handshakes += 1;
-                let sender = state.socket.create_sender();
-                let runtime = state.runtime.clone();
+                let (handle, conn) = state.inner.finish_accept(handle, conn, accepting_idx);
                 Ok(state
                     .recv_state
                     .connections
-                    .insert(handle, conn, sender, runtime))
+                    .insert(handle, conn, udp_sender, runtime))
             }
             Err(error) => {
+                let mut state = self.state.lock().unwrap();
+                let error = state
+                    .inner
+                    .finish_accept_error(error, &mut response_buffer);
                 if let Some(transmit) = error.response {
                     respond(transmit, &response_buffer, &mut state.sender);
                 }

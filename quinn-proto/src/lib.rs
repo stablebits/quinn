@@ -73,6 +73,8 @@ mod endpoint;
 pub use crate::endpoint::{
     AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
 };
+#[doc(hidden)]
+pub use crate::endpoint::{Accepting, AcceptingError};
 
 mod packet;
 pub use packet::{

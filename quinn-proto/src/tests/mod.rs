@@ -796,6 +796,71 @@ fn zero_rtt_incoming_buffer_size_total() {
 }
 
 #[test]
+fn accepting_buffers_retransmitted_initials() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+
+    let incoming = pair.server.waiting_incoming.pop().unwrap();
+    assert!(pair.server.waiting_incoming.is_empty());
+
+    let mut buf = Vec::new();
+    let accepting = pair.server.start_accept(incoming, pair.time, &mut buf, None).unwrap();
+    assert_eq!(pair.server.incoming_buffer_bytes(), 0);
+
+    pair.time = pair.client.next_wakeup().unwrap();
+    pair.drive_client();
+    assert!(!pair.server.inbound.is_empty());
+    pair.drive_server();
+
+    assert!(pair.server.waiting_incoming.is_empty());
+    assert!(pair.server.incoming_buffer_bytes() > 0);
+
+    let (server_ch, conn, accepting_idx) = match accepting.finish_without_endpoint() {
+        Ok(x) => x,
+        Err(_) => panic!("split accept unexpectedly failed"),
+    };
+    let (server_ch, conn) = pair.server.finish_accept(server_ch, conn, accepting_idx);
+    pair.server.connections.insert(server_ch, conn);
+    assert_eq!(pair.server.incoming_buffer_bytes(), 0);
+
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), Some(Event::Connected));
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeConfirmed)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), Some(Event::Connected));
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeConfirmed)
+    );
+
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
 fn alpn_success() {
     let _guard = subscribe();
     let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
