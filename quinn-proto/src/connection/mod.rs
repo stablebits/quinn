@@ -1357,6 +1357,11 @@ impl Connection {
         self.side.side()
     }
 
+    /// The connection ID this endpoint chose for the handshake.
+    pub fn handshake_cid(&self) -> ConnectionId {
+        self.handshake_cid
+    }
+
     /// The latest socket address for this connection's peer
     pub fn remote_address(&self) -> SocketAddr {
         self.path.remote
@@ -1373,6 +1378,34 @@ impl Connection {
     /// connection.
     pub fn local_ip(&self) -> Option<IpAddr> {
         self.local_ip
+    }
+
+    /// Process an incoming datagram already routed to this connection.
+    pub fn handle_connected_datagram(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+    ) {
+        let Ok((first_decode, remaining)) = PartialDecode::new(
+            data,
+            &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+            &self.endpoint_config.supported_versions,
+            self.endpoint_config.grease_quic_bit,
+        ) else {
+            return;
+        };
+
+        self.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(
+            DatagramConnectionEvent {
+                now,
+                remote,
+                ecn,
+                first_decode,
+                remaining,
+            },
+        )));
     }
 
     /// Current best estimate of this connection's latency (round-trip-time)

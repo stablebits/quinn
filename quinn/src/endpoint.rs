@@ -1,10 +1,10 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     future::Future,
     io::{self, IoSliceMut},
     mem,
-    net::{SocketAddr, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     pin::Pin,
     str,
     sync::{
@@ -102,7 +102,7 @@ impl Endpoint {
 
     /// Returns relevant stats from this Endpoint
     pub fn stats(&self) -> EndpointStats {
-        self.inner.state.lock().unwrap().stats
+        self.inner.proto.lock().unwrap().stats
     }
 
     /// Helper to construct an endpoint for use with both incoming and outgoing connections
@@ -199,7 +199,7 @@ impl Endpoint {
 
     /// Set the client configuration used by `connect`
     pub fn set_default_client_config(&self, config: ClientConfig) {
-        self.inner.0.state.lock().unwrap().default_client_config = Some(config);
+        self.inner.0.proto.lock().unwrap().default_client_config = Some(config);
     }
 
     /// Connect to a remote endpoint
@@ -214,7 +214,7 @@ impl Endpoint {
         let Some(config) = self
             .inner
             .0
-            .state
+            .proto
             .lock()
             .unwrap()
             .default_client_config
@@ -237,26 +237,44 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
-        let mut endpoint = self.inner.state.lock().unwrap();
-        if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
+        let (driver_lost, ipv6) = {
+            let endpoint = self.inner.proto.lock().unwrap();
+            (endpoint.driver_lost, endpoint.ipv6)
+        };
+        if driver_lost
+            || self
+                .inner
+                .io
+                .lock()
+                .unwrap()
+                .recv_state
+                .connections
+                .close
+                .is_some()
+        {
             return Err(ConnectError::EndpointStopping);
         }
-        if addr.is_ipv6() && !endpoint.ipv6 {
+        if addr.is_ipv6() && !ipv6 {
             return Err(ConnectError::InvalidRemoteAddress(addr));
         }
-        let addr = if endpoint.ipv6 {
+        let addr = if ipv6 {
             SocketAddr::V6(ensure_ipv6(addr))
         } else {
             addr
         };
 
-        let (ch, conn) = endpoint
-            .inner
-            .connect(self.runtime.now(), config, addr, server_name)?;
+        let (ch, conn) = {
+            let mut endpoint = self.inner.proto.lock().unwrap();
+            let result = endpoint
+                .inner
+                .connect(self.runtime.now(), config, addr, server_name)?;
+            endpoint.stats.outgoing_handshakes += 1;
+            result
+        };
 
-        let sender = endpoint.socket.create_sender();
-        endpoint.stats.outgoing_handshakes += 1;
-        Ok(endpoint
+        let mut io = self.inner.io.lock().unwrap();
+        let sender = io.socket.create_sender();
+        Ok(io
             .recv_state
             .connections
             .insert(ch, conn, sender, self.runtime.clone()))
@@ -278,16 +296,19 @@ impl Endpoint {
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
         let addr = socket.local_addr()?;
-        let mut inner = self.inner.state.lock().unwrap();
-        inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
-        inner.ipv6 = addr.is_ipv6();
-
-        // Update connection socket references
-        for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
+        {
+            let mut io = self.inner.io.lock().unwrap();
+            io.prev_socket = Some(mem::replace(&mut io.socket, socket));
+            io.recv_state
+                .connections
+                .send_rebind(|| io.socket.create_sender());
         }
-        if let Some(driver) = inner.driver.take() {
+        let driver = {
+            let mut proto = self.inner.proto.lock().unwrap();
+            proto.ipv6 = addr.is_ipv6();
+            proto.driver.take()
+        };
+        if let Some(driver) = driver {
             // Ensure the driver can register for wake-ups from the new socket
             driver.wake();
         }
@@ -300,7 +321,7 @@ impl Endpoint {
     /// Useful for e.g. refreshing TLS certificates without disrupting existing connections.
     pub fn set_server_config(&self, server_config: Option<ServerConfig>) {
         self.inner
-            .state
+            .proto
             .lock()
             .unwrap()
             .inner
@@ -309,12 +330,12 @@ impl Endpoint {
 
     /// Get the local `SocketAddr` the underlying socket is bound to
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.state.lock().unwrap().socket.local_addr()
+        self.inner.io.lock().unwrap().socket.local_addr()
     }
 
     /// Get the number of connections that are currently open
     pub fn open_connections(&self) -> usize {
-        self.inner.state.lock().unwrap().inner.open_connections()
+        self.inner.proto.lock().unwrap().inner.open_connections()
     }
 
     /// Close all of this endpoint's connections immediately and cease accepting new connections.
@@ -324,15 +345,12 @@ impl Endpoint {
     /// [`Connection::close()`]: crate::Connection::close
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         let reason = Bytes::copy_from_slice(reason);
-        let mut endpoint = self.inner.state.lock().unwrap();
+        let mut endpoint = self.inner.io.lock().unwrap();
         endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
-        for sender in endpoint.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
-                error_code,
-                reason: reason.clone(),
-            });
-        }
+        endpoint
+            .recv_state
+            .connections
+            .send_close(error_code, reason.clone());
         self.inner.shared.incoming.notify_waiters();
     }
 
@@ -349,7 +367,7 @@ impl Endpoint {
     pub async fn wait_idle(&self) {
         loop {
             {
-                let endpoint = &mut *self.inner.state.lock().unwrap();
+                let endpoint = &mut *self.inner.io.lock().unwrap();
                 if endpoint.recv_state.connections.is_empty() {
                     break;
                 }
@@ -393,26 +411,29 @@ impl Future for EndpointDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut endpoint = self.0.state.lock().unwrap();
-        if endpoint.driver.is_none() {
-            endpoint.driver = Some(cx.waker().clone());
+        {
+            let mut endpoint = self.0.proto.lock().unwrap();
+            if endpoint.driver.is_none() {
+                endpoint.driver = Some(cx.waker().clone());
+            }
         }
 
-        let now = endpoint.runtime.now();
-        let mut keep_going = false;
-        keep_going |= endpoint.drive_recv(cx, now)?;
-        keep_going |= endpoint.handle_events(cx, &self.0.shared);
-
-        if !endpoint.recv_state.incoming.is_empty() {
-            self.0.shared.incoming.notify_waiters();
-        }
+        let now = self.0.runtime.now();
+        let mut keep_going = {
+            let mut io = self.0.io.lock().unwrap();
+            let keep_going = io.drive_recv(cx, &self.0.proto, &*self.0.runtime, now)?;
+            if !io.recv_state.incoming.is_empty() {
+                self.0.shared.incoming.notify_waiters();
+            }
+            keep_going
+        };
+        keep_going |= self.0.handle_events(cx, &self.0.shared);
 
         if self.0.shared.ref_count.load(Ordering::Relaxed) == 0
-            && endpoint.recv_state.connections.is_empty()
+            && self.0.io.lock().unwrap().recv_state.connections.is_empty()
         {
             Poll::Ready(Ok(()))
         } else {
-            drop(endpoint);
             // If there is more work to do schedule the endpoint task again.
             // `wake_by_ref()` is called outside the lock to minimize
             // lock contention on a multithreaded runtime.
@@ -426,19 +447,20 @@ impl Future for EndpointDriver {
 
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
-        let mut endpoint = self.0.state.lock().unwrap();
-        endpoint.driver_lost = true;
+        self.0.proto.lock().unwrap().driver_lost = true;
         self.0.shared.incoming.notify_waiters();
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
-        endpoint.recv_state.connections.senders.clear();
+        self.0.io.lock().unwrap().recv_state.connections.clear();
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
-    pub(crate) state: Mutex<State>,
+    pub(crate) proto: Mutex<ProtoState>,
+    pub(crate) io: Mutex<IoState>,
     pub(crate) shared: Shared,
+    runtime: Arc<dyn Runtime>,
 }
 
 impl EndpointInner {
@@ -447,25 +469,33 @@ impl EndpointInner {
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<Connecting, ConnectionError> {
-        let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
-        let now = state.runtime.now();
-        match state
-            .inner
-            .accept(incoming, now, &mut response_buffer, server_config)
-        {
+        let now = self.runtime.now();
+        let result = {
+            self.proto.lock().unwrap().inner.accept(
+                incoming,
+                now,
+                &mut response_buffer,
+                server_config,
+            )
+        };
+        match result {
             Ok((handle, conn)) => {
-                state.stats.accepted_handshakes += 1;
-                let sender = state.socket.create_sender();
-                let runtime = state.runtime.clone();
-                Ok(state
+                self.proto.lock().unwrap().stats.accepted_handshakes += 1;
+                let mut io = self.io.lock().unwrap();
+                let sender = io.socket.create_sender();
+                Ok(io
                     .recv_state
                     .connections
-                    .insert(handle, conn, sender, runtime))
+                    .insert(handle, conn, sender, self.runtime.clone()))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
-                    respond(transmit, &response_buffer, &mut state.sender);
+                    respond(
+                        transmit,
+                        &response_buffer,
+                        &mut self.io.lock().unwrap().sender,
+                    );
                 }
                 Err(error.cause)
             }
@@ -473,44 +503,98 @@ impl EndpointInner {
     }
 
     pub(crate) fn refuse(&self, incoming: proto::Incoming) {
-        let mut state = self.state.lock().unwrap();
-        state.stats.refused_handshakes += 1;
+        self.proto.lock().unwrap().stats.refused_handshakes += 1;
         let mut response_buffer = Vec::new();
-        let transmit = state.inner.refuse(incoming, &mut response_buffer);
-        respond(transmit, &response_buffer, &mut state.sender);
+        let transmit = self
+            .proto
+            .lock()
+            .unwrap()
+            .inner
+            .refuse(incoming, &mut response_buffer);
+        respond(
+            transmit,
+            &response_buffer,
+            &mut self.io.lock().unwrap().sender,
+        );
     }
 
     pub(crate) fn retry(&self, incoming: proto::Incoming) -> Result<(), proto::RetryError> {
-        let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
-        let transmit = state.inner.retry(incoming, &mut response_buffer)?;
-        respond(transmit, &response_buffer, &mut state.sender);
+        let transmit = self
+            .proto
+            .lock()
+            .unwrap()
+            .inner
+            .retry(incoming, &mut response_buffer)?;
+        respond(
+            transmit,
+            &response_buffer,
+            &mut self.io.lock().unwrap().sender,
+        );
         Ok(())
     }
 
     pub(crate) fn ignore(&self, incoming: proto::Incoming) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.proto.lock().unwrap();
         state.stats.ignored_handshakes += 1;
         state.inner.ignore(incoming);
+    }
+
+    fn handle_events(&self, cx: &mut Context<'_>, shared: &Shared) -> bool {
+        for _ in 0..IO_LOOP_BOUND {
+            let (ch, event) = {
+                let mut state = self.proto.lock().unwrap();
+                match state.events.poll_recv(cx) {
+                    Poll::Ready(Some(x)) => x,
+                    Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
+                    Poll::Pending => {
+                        return false;
+                    }
+                }
+            };
+
+            let drained = event.is_drained();
+            let retired_seq = event.retired_local_cid_seq();
+            let conn_event = self.proto.lock().unwrap().inner.handle_event(ch, event);
+
+            let mut io = self.io.lock().unwrap();
+            if let Some(seq) = retired_seq {
+                io.recv_state.connections.retire(ch, seq);
+            }
+            if drained {
+                io.recv_state.connections.remove(ch);
+                if io.recv_state.connections.is_empty() {
+                    shared.idle.notify_waiters();
+                }
+            }
+            if let Some(event) = conn_event {
+                let _ = io.recv_state.connections.send_proto(ch, event);
+            }
+        }
+
+        true
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct State {
+pub(crate) struct ProtoState {
+    inner: proto::Endpoint,
+    driver: Option<Waker>,
+    ipv6: bool,
+    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
+    driver_lost: bool,
+    stats: EndpointStats,
+    default_client_config: Option<ClientConfig>,
+}
+
+#[derive(Debug)]
+pub(crate) struct IoState {
     socket: Box<dyn AsyncUdpSocket>,
     sender: Pin<Box<dyn UdpSender>>,
     /// During an active migration, abandoned_socket receives traffic
     /// until the first packet arrives on the new socket.
     prev_socket: Option<Box<dyn AsyncUdpSocket>>,
-    inner: proto::Endpoint,
     recv_state: RecvState,
-    driver: Option<Waker>,
-    ipv6: bool,
-    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
-    driver_lost: bool,
-    runtime: Arc<dyn Runtime>,
-    stats: EndpointStats,
-    default_client_config: Option<ClientConfig>,
 }
 
 #[derive(Debug)]
@@ -521,18 +605,24 @@ pub(crate) struct Shared {
     ref_count: AtomicUsize,
 }
 
-impl State {
-    fn drive_recv(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
-        let get_time = || self.runtime.now();
+impl IoState {
+    fn drive_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        proto: &Mutex<ProtoState>,
+        runtime: &dyn Runtime,
+        now: Instant,
+    ) -> Result<bool, io::Error> {
+        let get_time = || runtime.now();
         self.recv_state.recv_limiter.start_cycle(get_time);
         if let Some(socket) = &mut self.prev_socket {
             // We don't care about the `PollProgress` from old sockets.
             let poll_res = self.recv_state.poll_socket(
                 cx,
-                &mut self.inner,
+                proto,
                 &mut **socket,
                 &mut self.sender,
-                &*self.runtime,
+                runtime,
                 now,
             );
             if poll_res.is_err() {
@@ -541,10 +631,10 @@ impl State {
         };
         let poll_res = self.recv_state.poll_socket(
             cx,
-            &mut self.inner,
+            proto,
             &mut *self.socket,
             &mut self.sender,
-            &*self.runtime,
+            runtime,
             now,
         );
         self.recv_state.recv_limiter.finish_cycle(get_time);
@@ -556,44 +646,14 @@ impl State {
         }
         Ok(poll_res.keep_going)
     }
-
-    fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
-        for _ in 0..IO_LOOP_BOUND {
-            let (ch, event) = match self.events.poll_recv(cx) {
-                Poll::Ready(Some(x)) => x,
-                Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
-                Poll::Pending => {
-                    return false;
-                }
-            };
-
-            if event.is_drained() {
-                self.recv_state.connections.senders.remove(&ch);
-                if self.recv_state.connections.is_empty() {
-                    shared.idle.notify_waiters();
-                }
-            }
-            let Some(event) = self.inner.handle_event(ch, event) else {
-                continue;
-            };
-            // Ignoring errors from dropped connections that haven't yet been cleaned up
-            let _ = self
-                .recv_state
-                .connections
-                .senders
-                .get_mut(&ch)
-                .unwrap()
-                .send(ConnectionEvent::Proto(event));
-        }
-
-        true
-    }
 }
 
-impl Drop for State {
+impl Drop for EndpointInner {
     fn drop(&mut self) {
-        for incoming in self.recv_state.incoming.drain(..) {
-            self.inner.ignore(incoming);
+        let io = self.io.get_mut().unwrap();
+        let proto = self.proto.get_mut().unwrap();
+        for incoming in io.recv_state.incoming.drain(..) {
+            proto.inner.ignore(incoming);
         }
     }
 }
@@ -659,12 +719,30 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 
 #[derive(Debug)]
 struct ConnectionSet {
-    /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    connections: FxHashMap<ConnectionHandle, ConnectionRoutes>,
+    cids: FxHashMap<proto::ConnectionId, ConnectionHandle>,
+    incoming_remotes: HashMap<FourTupleKey, ConnectionHandle>,
+    outgoing_remotes: HashMap<SocketAddr, ConnectionHandle>,
     /// Stored to give out clones to new ConnectionInners
     sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
+    local_cid_len: usize,
+}
+
+#[derive(Debug)]
+struct ConnectionRoutes {
+    sender: mpsc::UnboundedSender<ConnectionEvent>,
+    remote: SocketAddr,
+    local_ip: Option<IpAddr>,
+    side: proto::Side,
+    local_cids: FxHashMap<u64, proto::ConnectionId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct FourTupleKey {
+    remote: SocketAddr,
+    local_ip: Option<IpAddr>,
 }
 
 impl ConnectionSet {
@@ -683,12 +761,159 @@ impl ConnectionSet {
             })
             .unwrap();
         }
-        self.senders.insert(handle, send);
+        let mut local_cids = FxHashMap::default();
+        let handshake_cid = conn.handshake_cid();
+        if handshake_cid.is_empty() {
+            debug_assert_eq!(self.local_cid_len, 0);
+            match conn.side() {
+                proto::Side::Server => {
+                    self.incoming_remotes.insert(
+                        FourTupleKey {
+                            remote: conn.remote_address(),
+                            local_ip: conn.local_ip(),
+                        },
+                        handle,
+                    );
+                }
+                proto::Side::Client => {
+                    self.outgoing_remotes.insert(conn.remote_address(), handle);
+                }
+            }
+        } else {
+            local_cids.insert(0, handshake_cid);
+            self.cids.insert(handshake_cid, handle);
+        }
+        self.connections.insert(
+            handle,
+            ConnectionRoutes {
+                sender: send.clone(),
+                remote: conn.remote_address(),
+                local_ip: conn.local_ip(),
+                side: conn.side(),
+                local_cids,
+            },
+        );
         Connecting::new(handle, conn, self.sender.clone(), recv, sender, runtime)
     }
 
+    fn try_route_fast(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<proto::EcnCodepoint>,
+        data: BytesMut,
+    ) -> Option<BytesMut> {
+        let Some(handle) = self.lookup_fast(remote, local_ip, &data) else {
+            return Some(data);
+        };
+        let Some(connection) = self.connections.get_mut(&handle) else {
+            return Some(data);
+        };
+        let _ = connection.sender.send(ConnectionEvent::Datagram {
+            now,
+            remote,
+            ecn,
+            data,
+        });
+        None
+    }
+
+    fn lookup_fast(
+        &self,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        data: &[u8],
+    ) -> Option<ConnectionHandle> {
+        let cid = fast_path_dst_cid(data, self.local_cid_len)?;
+        if cid.is_empty() {
+            self.incoming_remotes
+                .get(&FourTupleKey { remote, local_ip })
+                .copied()
+                .or_else(|| self.outgoing_remotes.get(&remote).copied())
+        } else {
+            self.cids.get(&cid).copied()
+        }
+    }
+
+    fn send_proto(
+        &mut self,
+        handle: ConnectionHandle,
+        event: proto::ConnectionEvent,
+    ) -> Result<(), mpsc::error::SendError<ConnectionEvent>> {
+        self.connections
+            .get_mut(&handle)
+            .unwrap()
+            .sender
+            .send(ConnectionEvent::Proto(event))
+    }
+
+    fn send_close(&self, error_code: VarInt, reason: Bytes) {
+        for connection in self.connections.values() {
+            let _ = connection.sender.send(ConnectionEvent::Close {
+                error_code,
+                reason: reason.clone(),
+            });
+        }
+    }
+
+    fn send_rebind(&self, mut make_sender: impl FnMut() -> Pin<Box<dyn UdpSender>>) {
+        for connection in self.connections.values() {
+            let _ = connection
+                .sender
+                .send(ConnectionEvent::Rebind(make_sender()));
+        }
+    }
+
+    fn retire(&mut self, handle: ConnectionHandle, sequence: u64) {
+        if let Some(connection) = self.connections.get_mut(&handle) {
+            if let Some(cid) = connection.local_cids.remove(&sequence) {
+                self.cids.remove(&cid);
+            }
+        }
+    }
+
+    fn remove(&mut self, handle: ConnectionHandle) {
+        let Some(connection) = self.connections.remove(&handle) else {
+            return;
+        };
+        for cid in connection.local_cids.values() {
+            self.cids.remove(cid);
+        }
+        match connection.side {
+            proto::Side::Server => {
+                self.incoming_remotes.remove(&FourTupleKey {
+                    remote: connection.remote,
+                    local_ip: connection.local_ip,
+                });
+            }
+            proto::Side::Client => {
+                self.outgoing_remotes.remove(&connection.remote);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.connections.clear();
+        self.cids.clear();
+        self.incoming_remotes.clear();
+        self.outgoing_remotes.clear();
+    }
+
     fn is_empty(&self) -> bool {
-        self.senders.is_empty()
+        self.connections.is_empty()
+    }
+}
+
+fn fast_path_dst_cid(data: &[u8], short_cid_len: usize) -> Option<proto::ConnectionId> {
+    let first = *data.first()?;
+    if first & 0x80 != 0 {
+        let rest = data.get(5..)?;
+        let (&len, cid_bytes) = rest.split_first()?;
+        let cid = cid_bytes.get(..len as usize)?;
+        Some(proto::ConnectionId::new(cid))
+    } else {
+        Some(proto::ConnectionId::new(data.get(1..1 + short_cid_len)?))
     }
 }
 
@@ -712,17 +937,17 @@ impl Future for Accept<'_> {
     type Output = Option<Incoming>;
     fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
-        let mut endpoint = this.endpoint.inner.state.lock().unwrap();
-        if endpoint.driver_lost {
+        if this.endpoint.inner.proto.lock().unwrap().driver_lost {
             return Poll::Ready(None);
         }
-        if let Some(incoming) = endpoint.recv_state.incoming.pop_front() {
+        let mut io = this.endpoint.inner.io.lock().unwrap();
+        if let Some(incoming) = io.recv_state.incoming.pop_front() {
             // Release the mutex lock on endpoint so cloning it doesn't deadlock
-            drop(endpoint);
+            drop(io);
             let incoming = Incoming::new(incoming, this.endpoint.inner.clone());
             return Poll::Ready(Some(incoming));
         }
-        if endpoint.recv_state.connections.close.is_some() {
+        if io.recv_state.connections.close.is_some() {
             return Poll::Ready(None);
         }
         loop {
@@ -757,20 +982,22 @@ impl EndpointRef {
                 idle: Notify::new(),
                 ref_count: AtomicUsize::new(0),
             },
-            state: Mutex::new(State {
-                socket,
-                sender,
-                prev_socket: None,
+            proto: Mutex::new(ProtoState {
                 inner,
                 ipv6,
                 events,
                 driver: None,
                 driver_lost: false,
-                recv_state,
-                runtime,
                 stats: EndpointStats::default(),
                 default_client_config: None,
             }),
+            io: Mutex::new(IoState {
+                socket,
+                sender,
+                prev_socket: None,
+                recv_state,
+            }),
+            runtime,
         }))
     }
 }
@@ -788,7 +1015,7 @@ impl Drop for EndpointRef {
             return;
         }
 
-        let endpoint = &mut *self.0.state.lock().unwrap();
+        let endpoint = &mut *self.0.proto.lock().unwrap();
         // If the driver is about to be on its own, ensure it can shut down if the last
         // connection is gone.
         if let Some(task) = endpoint.driver.take() {
@@ -826,9 +1053,13 @@ impl RecvState {
         ];
         Self {
             connections: ConnectionSet {
-                senders: FxHashMap::default(),
+                connections: FxHashMap::default(),
+                cids: FxHashMap::default(),
+                incoming_remotes: HashMap::default(),
+                outgoing_remotes: HashMap::default(),
                 sender,
                 close: None,
+                local_cid_len: endpoint.local_cid_len(),
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
@@ -839,7 +1070,7 @@ impl RecvState {
     fn poll_socket(
         &mut self,
         cx: &mut Context<'_>,
-        endpoint: &mut proto::Endpoint,
+        endpoint: &Mutex<ProtoState>,
         socket: &mut dyn AsyncUdpSocket,
         sender: &mut Pin<Box<dyn UdpSender>>,
         runtime: &dyn Runtime,
@@ -866,8 +1097,18 @@ impl RecvState {
                         let mut data: BytesMut = buf[0..meta.len].into();
                         while !data.is_empty() {
                             let buf = data.split_to(meta.stride.min(data.len()));
+                            let Some(buf) = self.connections.try_route_fast(
+                                now,
+                                meta.addr,
+                                meta.dst_ip,
+                                meta.ecn.map(proto_ecn),
+                                buf,
+                            ) else {
+                                received_connection_packet = true;
+                                continue;
+                            };
                             let mut response_buffer = Vec::new();
-                            match endpoint.handle(
+                            match endpoint.lock().unwrap().inner.handle(
                                 now,
                                 meta.addr,
                                 meta.dst_ip,
@@ -879,20 +1120,18 @@ impl RecvState {
                                     if self.connections.close.is_none() {
                                         self.incoming.push_back(incoming);
                                     } else {
-                                        let transmit =
-                                            endpoint.refuse(incoming, &mut response_buffer);
+                                        let transmit = endpoint
+                                            .lock()
+                                            .unwrap()
+                                            .inner
+                                            .refuse(incoming, &mut response_buffer);
                                         respond(transmit, &response_buffer, sender);
                                     }
                                 }
                                 Some(DatagramEvent::ConnectionEvent(handle, event)) => {
                                     // Ignoring errors from dropped connections that haven't yet been cleaned up
                                     received_connection_packet = true;
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                    let _ = self.connections.send_proto(handle, event);
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
                                     respond(transmit, &response_buffer, sender);
@@ -944,4 +1183,101 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_path_short_header_cid() {
+        let cid = [1, 2, 3, 4];
+        let data = [0x40, 1, 2, 3, 4, 0xaa];
+        assert_eq!(
+            fast_path_dst_cid(&data, cid.len()),
+            Some(proto::ConnectionId::new(&cid))
+        );
+    }
+
+    #[test]
+    fn fast_route_delivers_datagram_by_cid() {
+        let handle = ConnectionHandle(7);
+        let (endpoint_send, _endpoint_recv) = mpsc::unbounded_channel();
+        let (conn_send, mut conn_recv) = mpsc::unbounded_channel();
+        let cid = proto::ConnectionId::new(&[9, 8, 7, 6]);
+        let remote: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let data = BytesMut::from(&[0x40, 9, 8, 7, 6, 0xaa][..]);
+
+        let mut routes = FxHashMap::default();
+        let mut local_cids = FxHashMap::default();
+        local_cids.insert(0, cid);
+        routes.insert(
+            handle,
+            ConnectionRoutes {
+                sender: conn_send,
+                remote,
+                local_ip: None,
+                side: proto::Side::Client,
+                local_cids,
+            },
+        );
+        let mut set = ConnectionSet {
+            connections: routes,
+            cids: FxHashMap::from_iter([(cid, handle)]),
+            incoming_remotes: HashMap::default(),
+            outgoing_remotes: HashMap::default(),
+            sender: endpoint_send,
+            close: None,
+            local_cid_len: cid.len(),
+        };
+
+        assert!(
+            set.try_route_fast(Instant::now(), remote, None, None, data.clone())
+                .is_none()
+        );
+        match conn_recv.try_recv().unwrap() {
+            ConnectionEvent::Datagram {
+                remote: got_remote,
+                data: got_data,
+                ..
+            } => {
+                assert_eq!(got_remote, remote);
+                assert_eq!(got_data, data);
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    #[test]
+    fn retired_cid_is_removed_from_fast_routes() {
+        let handle = ConnectionHandle(3);
+        let (endpoint_send, _endpoint_recv) = mpsc::unbounded_channel();
+        let (conn_send, _conn_recv) = mpsc::unbounded_channel();
+        let cid = proto::ConnectionId::new(&[1, 3, 3, 7]);
+        let remote: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+        let mut local_cids = FxHashMap::default();
+        local_cids.insert(0, cid);
+        let mut set = ConnectionSet {
+            connections: FxHashMap::from_iter([(
+                handle,
+                ConnectionRoutes {
+                    sender: conn_send,
+                    remote,
+                    local_ip: None,
+                    side: proto::Side::Client,
+                    local_cids,
+                },
+            )]),
+            cids: FxHashMap::from_iter([(cid, handle)]),
+            incoming_remotes: HashMap::default(),
+            outgoing_remotes: HashMap::default(),
+            sender: endpoint_send,
+            close: None,
+            local_cid_len: cid.len(),
+        };
+
+        set.retire(handle, 0);
+        assert_eq!(set.lookup_fast(remote, None, &[0x40, 1, 3, 3, 7, 0]), None);
+    }
 }

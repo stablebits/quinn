@@ -97,6 +97,12 @@ enum ConnectionEvent {
         error_code: VarInt,
         reason: bytes::Bytes,
     },
+    Datagram {
+        now: Instant,
+        remote: std::net::SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: bytes::BytesMut,
+    },
     Proto(proto::ConnectionEvent),
     Rebind(Pin<Box<dyn UdpSender>>),
 }
