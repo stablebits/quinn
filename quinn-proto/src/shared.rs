@@ -45,14 +45,6 @@ impl EndpointEvent {
     pub fn is_drained(&self) -> bool {
         self.0 == EndpointEventInner::Drained
     }
-
-    /// Sequence number of a local CID retired by the peer, if any.
-    pub fn retired_local_cid_seq(&self) -> Option<u64> {
-        match self.0 {
-            EndpointEventInner::RetireConnectionId(_, seq, _) => Some(seq),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

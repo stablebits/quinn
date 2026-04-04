@@ -880,11 +880,6 @@ impl Endpoint {
         &self.config
     }
 
-    /// Length in bytes of locally generated destination CIDs.
-    pub fn local_cid_len(&self) -> usize {
-        self.local_cid_generator.cid_len()
-    }
-
     /// Number of connections that are currently open
     pub fn open_connections(&self) -> usize {
         self.connections.len()

@@ -1112,14 +1112,6 @@ impl State {
                     self.sender = sender;
                     self.inner.local_address_changed();
                 }
-                Poll::Ready(Some(ConnectionEvent::Datagram {
-                    now,
-                    remote,
-                    ecn,
-                    data,
-                })) => {
-                    self.inner.handle_connected_datagram(now, remote, ecn, data);
-                }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
                     self.inner.handle_event(event);
                 }
