@@ -17,6 +17,7 @@ use rustls::{
 use tokio::runtime::{Builder, Runtime};
 use tracing::trace;
 
+pub mod contention;
 pub mod stats;
 
 pub fn configure_tracing_subscriber() {
@@ -147,6 +148,14 @@ pub async fn send_data_on_stream(stream: &mut quinn::SendStream, stream_size: u6
 
 pub fn rt() -> Runtime {
     Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+pub fn mt_rt(worker_threads: usize) -> Runtime {
+    Builder::new_multi_thread()
+        .worker_threads(worker_threads.max(1))
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 pub fn transport_config(opt: &Opt) -> quinn::TransportConfig {
