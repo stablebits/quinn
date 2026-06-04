@@ -521,9 +521,6 @@ impl Endpoint {
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<(ConnectionHandle, Connection), Box<AcceptError>> {
         let remote_address_validated = incoming.remote_address_validated();
-        incoming.improper_drop_warner.dismiss();
-        let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
-        self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
 
         let packet_number = incoming.packet.header.number.expand(0);
         let InitialHeader {
@@ -543,7 +540,7 @@ impl Endpoint {
             })
         {
             debug!("abandoning accept of stale initial");
-            self.index.remove_initial(dst_cid);
+            self.ignore(incoming);
             return Err(Box::new(AcceptError {
                 cause: ConnectionError::TimedOut,
                 response: None,
@@ -552,17 +549,18 @@ impl Endpoint {
 
         if self.cids_exhausted() {
             debug!("refusing connection");
-            self.index.remove_initial(dst_cid);
+            let response = self.initial_close(
+                version,
+                incoming.addresses,
+                &incoming.crypto,
+                src_cid,
+                TransportError::CONNECTION_REFUSED(""),
+                buf,
+            );
+            self.ignore(incoming);
             return Err(Box::new(AcceptError {
                 cause: ConnectionError::CidsExhausted,
-                response: Some(self.initial_close(
-                    version,
-                    incoming.addresses,
-                    &incoming.crypto,
-                    src_cid,
-                    TransportError::CONNECTION_REFUSED(""),
-                    buf,
-                )),
+                response: Some(response),
             }));
         }
 
@@ -578,15 +576,16 @@ impl Endpoint {
             .is_err()
         {
             debug!(packet_number, "failed to authenticate initial packet");
-            self.index.remove_initial(dst_cid);
+            self.ignore(incoming);
             return Err(Box::new(AcceptError {
                 cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
                 response: None,
             }));
         };
 
+        let accepting_idx = incoming.incoming_idx;
         let ch = ConnectionHandle(self.connections.vacant_key());
-        let loc_cid = self.new_cid(RouteDatagramTo::Connection(ch));
+        let loc_cid = self.new_cid(RouteDatagramTo::Incoming(accepting_idx));
         let mut params = TransportParameters::new(
             &server_config.transport,
             &self.config,
@@ -600,7 +599,7 @@ impl Endpoint {
         params.retry_src_cid = incoming.token.retry_src_cid;
         let mut pref_addr_cid = None;
         if server_config.has_preferred_address() {
-            let cid = self.new_cid(RouteDatagramTo::Connection(ch));
+            let cid = self.new_cid(RouteDatagramTo::Incoming(accepting_idx));
             pref_addr_cid = Some(cid);
             params.preferred_address = Some(PreferredAddress {
                 address_v4: server_config.preferred_address_v4,
@@ -610,18 +609,34 @@ impl Endpoint {
             });
         }
 
+        let reservation = AcceptReservation {
+            incoming_idx: accepting_idx,
+            init_cid: dst_cid,
+            addresses: incoming.addresses,
+            loc_cid,
+            pref_addr_cid,
+        };
+        self.pending_accepts += 1;
+
+        let mut rng_seed = [0; 32];
+        self.rng.fill_bytes(&mut rng_seed);
         let tls = server_config.crypto.clone().start_session(version, &params);
         let transport_config = server_config.transport.clone();
-        let mut conn = self.add_connection(
-            ch,
-            version,
-            dst_cid,
+        let mut conn = Connection::new(
+            self.config.clone(),
+            transport_config,
+            reservation.init_cid,
             loc_cid,
             src_cid,
-            incoming.addresses,
-            incoming.received_at,
+            reservation.addresses.remote,
+            reservation.addresses.local_ip,
             tls,
-            transport_config,
+            self.local_cid_generator.cid_len(),
+            self.local_cid_generator.cid_lifetime(),
+            incoming.received_at,
+            version,
+            self.allow_mtud,
+            rng_seed,
             SideArgs::Server {
                 server_config,
                 pref_addr_cid,
@@ -629,16 +644,26 @@ impl Endpoint {
             },
         );
 
+        incoming.improper_drop_warner.dismiss();
         match conn.handle_first_packet(
             incoming.received_at,
-            incoming.addresses.remote,
+            reservation.addresses.remote,
             incoming.ecn,
             packet_number,
             incoming.packet,
             incoming.rest,
         ) {
             Ok(()) => {
-                trace!(id = ch.0, icid = %dst_cid, "new connection");
+                let incoming_buffer = self.remove_accept_reservation(&reservation);
+                self.register_connection(
+                    ch,
+                    reservation.init_cid,
+                    reservation.loc_cid,
+                    reservation.pref_addr_cid,
+                    reservation.addresses,
+                    Side::Server,
+                );
+                trace!(id = ch.0, icid = %reservation.init_cid, "new connection");
 
                 for event in incoming_buffer.datagrams {
                     conn.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(event)))
@@ -648,11 +673,10 @@ impl Endpoint {
             }
             Err(e) => {
                 debug!("handshake failed: {}", e);
-                self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
                 let response = match e {
                     ConnectionError::TransportError(ref e) => Some(self.initial_close(
                         version,
-                        incoming.addresses,
+                        reservation.addresses,
                         &incoming.crypto,
                         src_cid,
                         e.clone(),
@@ -660,6 +684,7 @@ impl Endpoint {
                     )),
                     _ => None,
                 };
+                self.remove_accept_reservation(&reservation);
                 Err(Box::new(AcceptError { cause: e, response }))
             }
         }
@@ -781,6 +806,17 @@ impl Endpoint {
         let incoming_buffer = self.incoming_buffers.remove(incoming_idx);
         self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
         incoming_buffer
+    }
+
+    fn remove_accept_reservation(&mut self, reservation: &AcceptReservation) -> IncomingBuffer {
+        self.index.remove_initial(reservation.init_cid);
+        self.index.retire(reservation.loc_cid);
+        if let Some(cid) = reservation.pref_addr_cid {
+            self.index.retire(cid);
+        }
+        debug_assert!(self.pending_accepts > 0);
+        self.pending_accepts -= 1;
+        self.remove_incoming_buffer(reservation.incoming_idx)
     }
 
     /// Register endpoint-owned metadata and routes for an active connection.
@@ -1292,6 +1328,15 @@ pub struct AcceptError {
     pub cause: ConnectionError,
     /// Optional response to transmit back
     pub response: Option<Transmit>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct AcceptReservation {
+    incoming_idx: usize,
+    init_cid: ConnectionId,
+    addresses: FourTuple,
+    loc_cid: ConnectionId,
+    pref_addr_cid: Option<ConnectionId>,
 }
 
 /// Error for attempting to retry an [`Incoming`] which already bears a token from a previous retry
