@@ -527,6 +527,22 @@ impl Endpoint {
         }
     }
 
+    /// First phase of connection acceptance: everything that requires `&mut Endpoint`.
+    /// Reserves CIDs and routing state, but does NOT create the connection, process the first
+    /// packet, or replay buffered datagrams. This is the minimum work that must happen under the
+    /// endpoint lock.
+    #[cfg(feature = "__internal_split_accept")]
+    #[doc(hidden)]
+    pub fn start_accept(
+        &mut self,
+        incoming: Incoming,
+        now: Instant,
+        buf: &mut Vec<u8>,
+        server_config: Option<Arc<ServerConfig>>,
+    ) -> Result<Accepting, Box<AcceptError>> {
+        self.start_accept_inner(incoming, now, buf, server_config)
+    }
+
     pub(crate) fn start_accept_inner(
         &mut self,
         mut incoming: Incoming,
@@ -655,6 +671,12 @@ impl Endpoint {
         })
     }
 
+    #[cfg(feature = "__internal_split_accept")]
+    #[doc(hidden)]
+    pub fn finish_accept(&mut self, accepted: Accepted) -> (ConnectionHandle, Connection) {
+        self.finish_accept_inner(accepted)
+    }
+
     pub(crate) fn finish_accept_inner(
         &mut self,
         accepted: Accepted,
@@ -680,6 +702,18 @@ impl Endpoint {
         }
 
         (ch, conn)
+    }
+
+    /// Clean up after a failed [`Accepting::finish_without_endpoint`] and optionally generate a
+    /// close response.
+    #[cfg(feature = "__internal_split_accept")]
+    #[doc(hidden)]
+    pub fn finish_accept_error(
+        &mut self,
+        error: Box<AcceptingError>,
+        buf: &mut Vec<u8>,
+    ) -> Box<AcceptError> {
+        self.finish_accept_error_inner(error, buf)
     }
 
     pub(crate) fn finish_accept_error_inner(
@@ -1360,12 +1394,20 @@ struct AcceptReservation {
     pref_addr_cid: Option<ConnectionId>,
 }
 
-pub(crate) struct Accepted {
+/// Internal split-accept success state used by `quinn`.
+#[doc(hidden)]
+#[cfg_attr(not(feature = "__internal_split_accept"), allow(unreachable_pub))]
+#[allow(unnameable_types)] // internal split-accept API; re-exported only with __internal_split_accept
+pub struct Accepted {
     reservation: AcceptReservation,
     conn: Connection,
 }
 
-pub(crate) struct Accepting {
+/// Internal split-accept handle used by `quinn`.
+#[doc(hidden)]
+#[cfg_attr(not(feature = "__internal_split_accept"), allow(unreachable_pub))]
+#[allow(unnameable_types)] // internal split-accept API; re-exported only with __internal_split_accept
+pub struct Accepting {
     reservation: AcceptReservation,
     version: u32,
     src_cid: ConnectionId,
@@ -1382,7 +1424,16 @@ pub(crate) struct Accepting {
 }
 
 impl Accepting {
-    pub(crate) fn finish_without_endpoint(self) -> Result<Accepted, Box<AcceptingError>> {
+    /// Complete computationally expensive connection setup steps without holding the endpoint lock.
+    ///
+    /// Creates the `Connection` and processes the first packet.
+    /// None of this requires `&mut Endpoint`.
+    ///
+    /// On success, returns the connection plus the reservation that still needs to be activated
+    /// under the endpoint lock.
+    #[doc(hidden)]
+    #[cfg_attr(not(feature = "__internal_split_accept"), allow(unreachable_pub))]
+    pub fn finish_without_endpoint(self) -> Result<Accepted, Box<AcceptingError>> {
         self.incoming.improper_drop_warner.dismiss();
 
         let transport_config = self.server_config.transport.clone();
@@ -1436,7 +1487,11 @@ impl Accepting {
     }
 }
 
-pub(crate) struct AcceptingError {
+/// Internal split-accept failure state used by `quinn`.
+#[doc(hidden)]
+#[cfg_attr(not(feature = "__internal_split_accept"), allow(unreachable_pub))]
+#[allow(unnameable_types)] // internal split-accept API; re-exported only with __internal_split_accept
+pub struct AcceptingError {
     cause: ConnectionError,
     reservation: AcceptReservation,
     version: u32,
