@@ -515,11 +515,25 @@ impl Endpoint {
     // box err to avoid clippy::result_large_err
     pub fn accept(
         &mut self,
-        mut incoming: Incoming,
+        incoming: Incoming,
         now: Instant,
         buf: &mut Vec<u8>,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<(ConnectionHandle, Connection), Box<AcceptError>> {
+        let accepting = self.start_accept_inner(incoming, now, buf, server_config)?;
+        match accepting.finish_without_endpoint() {
+            Ok(accepted) => Ok(self.finish_accept_inner(accepted)),
+            Err(error) => Err(self.finish_accept_error_inner(error, buf)),
+        }
+    }
+
+    pub(crate) fn start_accept_inner(
+        &mut self,
+        mut incoming: Incoming,
+        now: Instant,
+        buf: &mut Vec<u8>,
+        server_config: Option<Arc<ServerConfig>>,
+    ) -> Result<Accepting, Box<AcceptError>> {
         let remote_address_validated = incoming.remote_address_validated();
 
         let packet_number = incoming.packet.header.number.expand(0);
@@ -584,7 +598,6 @@ impl Endpoint {
         };
 
         let accepting_idx = incoming.incoming_idx;
-        let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(RouteDatagramTo::Incoming(accepting_idx));
         let mut params = TransportParameters::new(
             &server_config.transport,
@@ -620,74 +633,81 @@ impl Endpoint {
 
         let mut rng_seed = [0; 32];
         self.rng.fill_bytes(&mut rng_seed);
-        let tls = server_config.crypto.clone().start_session(version, &params);
-        let transport_config = server_config.transport.clone();
-        let mut conn = Connection::new(
-            self.config.clone(),
-            transport_config,
-            reservation.init_cid,
-            loc_cid,
-            src_cid,
-            reservation.addresses.remote,
-            reservation.addresses.local_ip,
-            tls,
-            self.local_cid_generator.cid_len(),
-            self.local_cid_generator.cid_lifetime(),
-            incoming.received_at,
+        let endpoint_config = self.config.clone();
+        let cid_len = self.local_cid_generator.cid_len();
+        let cid_lifetime = self.local_cid_generator.cid_lifetime();
+        let allow_mtud = self.allow_mtud;
+
+        Ok(Accepting {
+            reservation,
             version,
-            self.allow_mtud,
-            rng_seed,
-            SideArgs::Server {
-                server_config,
-                pref_addr_cid,
-                path_validated: remote_address_validated,
-            },
-        );
-
-        incoming.improper_drop_warner.dismiss();
-        match conn.handle_first_packet(
-            incoming.received_at,
-            reservation.addresses.remote,
-            incoming.ecn,
+            src_cid,
             packet_number,
-            incoming.packet,
-            incoming.rest,
-        ) {
-            Ok(()) => {
-                let incoming_buffer = self.remove_accept_reservation(&reservation);
-                self.register_connection(
-                    ch,
-                    reservation.init_cid,
-                    reservation.loc_cid,
-                    reservation.pref_addr_cid,
-                    reservation.addresses,
-                    Side::Server,
-                );
-                trace!(id = ch.0, icid = %reservation.init_cid, "new connection");
+            incoming,
+            server_config,
+            params,
+            remote_address_validated,
+            rng_seed,
+            endpoint_config,
+            cid_len,
+            cid_lifetime,
+            allow_mtud,
+        })
+    }
 
-                for event in incoming_buffer.datagrams {
-                    conn.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(event)))
-                }
+    pub(crate) fn finish_accept_inner(
+        &mut self,
+        accepted: Accepted,
+    ) -> (ConnectionHandle, Connection) {
+        let Accepted {
+            reservation,
+            mut conn,
+        } = accepted;
+        let incoming_buffer = self.remove_accept_reservation(&reservation);
+        let ch = ConnectionHandle(self.connections.vacant_key());
+        self.register_connection(
+            ch,
+            reservation.init_cid,
+            reservation.loc_cid,
+            reservation.pref_addr_cid,
+            reservation.addresses,
+            Side::Server,
+        );
+        trace!(id = ch.0, icid = %reservation.init_cid, "new connection");
 
-                Ok((ch, conn))
-            }
-            Err(e) => {
-                debug!("handshake failed: {}", e);
-                let response = match e {
-                    ConnectionError::TransportError(ref e) => Some(self.initial_close(
-                        version,
-                        reservation.addresses,
-                        &incoming.crypto,
-                        src_cid,
-                        e.clone(),
-                        buf,
-                    )),
-                    _ => None,
-                };
-                self.remove_accept_reservation(&reservation);
-                Err(Box::new(AcceptError { cause: e, response }))
-            }
+        for event in incoming_buffer.datagrams {
+            conn.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(event)))
         }
+
+        (ch, conn)
+    }
+
+    pub(crate) fn finish_accept_error_inner(
+        &mut self,
+        error: Box<AcceptingError>,
+        buf: &mut Vec<u8>,
+    ) -> Box<AcceptError> {
+        let AcceptingError {
+            cause,
+            reservation,
+            version,
+            src_cid,
+            crypto,
+        } = *error;
+        debug!("handshake failed: {}", cause);
+        let response = match cause {
+            ConnectionError::TransportError(ref e) => Some(self.initial_close(
+                version,
+                reservation.addresses,
+                &crypto,
+                src_cid,
+                e.clone(),
+                buf,
+            )),
+            _ => None,
+        };
+        self.remove_accept_reservation(&reservation);
+        Box::new(AcceptError { cause, response })
     }
 
     /// Check if we should refuse a connection attempt regardless of the packet's contents
@@ -1337,6 +1357,90 @@ struct AcceptReservation {
     addresses: FourTuple,
     loc_cid: ConnectionId,
     pref_addr_cid: Option<ConnectionId>,
+}
+
+pub(crate) struct Accepted {
+    reservation: AcceptReservation,
+    conn: Connection,
+}
+
+pub(crate) struct Accepting {
+    reservation: AcceptReservation,
+    version: u32,
+    src_cid: ConnectionId,
+    packet_number: u64,
+    incoming: Incoming,
+    server_config: Arc<ServerConfig>,
+    params: TransportParameters,
+    remote_address_validated: bool,
+    rng_seed: [u8; 32],
+    endpoint_config: Arc<EndpointConfig>,
+    cid_len: usize,
+    cid_lifetime: Option<Duration>,
+    allow_mtud: bool,
+}
+
+impl Accepting {
+    pub(crate) fn finish_without_endpoint(self) -> Result<Accepted, Box<AcceptingError>> {
+        self.incoming.improper_drop_warner.dismiss();
+
+        let transport_config = self.server_config.transport.clone();
+        let tls = self
+            .server_config
+            .crypto
+            .clone()
+            .start_session(self.version, &self.params);
+        let mut conn = Connection::new(
+            self.endpoint_config,
+            transport_config,
+            self.reservation.init_cid,
+            self.reservation.loc_cid,
+            self.src_cid,
+            self.incoming.addresses.remote,
+            self.incoming.addresses.local_ip,
+            tls,
+            self.cid_len,
+            self.cid_lifetime,
+            self.incoming.received_at,
+            self.version,
+            self.allow_mtud,
+            self.rng_seed,
+            SideArgs::Server {
+                server_config: self.server_config,
+                pref_addr_cid: self.reservation.pref_addr_cid,
+                path_validated: self.remote_address_validated,
+            },
+        );
+
+        match conn.handle_first_packet(
+            self.incoming.received_at,
+            self.incoming.addresses.remote,
+            self.incoming.ecn,
+            self.packet_number,
+            self.incoming.packet,
+            self.incoming.rest,
+        ) {
+            Ok(()) => Ok(Accepted {
+                reservation: self.reservation,
+                conn,
+            }),
+            Err(e) => Err(Box::new(AcceptingError {
+                cause: e,
+                reservation: self.reservation,
+                version: self.version,
+                src_cid: self.src_cid,
+                crypto: self.incoming.crypto,
+            })),
+        }
+    }
+}
+
+pub(crate) struct AcceptingError {
+    cause: ConnectionError,
+    reservation: AcceptReservation,
+    version: u32,
+    src_cid: ConnectionId,
+    crypto: Keys,
 }
 
 /// Error for attempting to retry an [`Incoming`] which already bears a token from a previous retry
