@@ -43,6 +43,7 @@ pub struct Endpoint {
     rng: StdRng,
     index: ConnectionIndex,
     connections: Slab<ConnectionMeta>,
+    pending_accepts: usize,
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
     config: Arc<EndpointConfig>,
     server_config: Option<Arc<ServerConfig>>,
@@ -72,6 +73,7 @@ impl Endpoint {
                 .map_or_else(StdRng::from_os_rng, StdRng::from_seed),
             index: ConnectionIndex::default(),
             connections: Slab::new(),
+            pending_accepts: 0,
             local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
             config,
             server_config,
@@ -923,6 +925,12 @@ impl Endpoint {
         self.connections.len()
     }
 
+    /// Number of incoming accepts that have reserved endpoint state but have not yet been
+    /// finalized into active outer connections.
+    pub fn pending_accepts(&self) -> usize {
+        self.pending_accepts
+    }
+
     /// Counter for the number of bytes currently used
     /// in the buffers for Initial and 0-RTT messages for pending incoming connections
     pub fn incoming_buffer_bytes(&self) -> u64 {
@@ -972,6 +980,7 @@ impl fmt::Debug for Endpoint {
             .field("rng", &self.rng)
             .field("index", &self.index)
             .field("connections", &self.connections)
+            .field("pending_accepts", &self.pending_accepts)
             .field("config", &self.config)
             .field("server_config", &self.server_config)
             // incoming_buffers too large
