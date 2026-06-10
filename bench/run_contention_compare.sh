@@ -14,6 +14,7 @@ SERVER_WORKER_THREADS="${SERVER_WORKER_THREADS:-8}"
 SERVER_INITIAL_MTU="${SERVER_INITIAL_MTU:-1200}"
 SERVER_MAX_CONCURRENT_UNI_STREAMS="${SERVER_MAX_CONCURRENT_UNI_STREAMS:-131072}"
 SERVER_MAX_CONCURRENT_HANDSHAKES="${SERVER_MAX_CONCURRENT_HANDSHAKES:-0}"
+SERVER_HANDSHAKE_THREADS="${SERVER_HANDSHAKE_THREADS:-0}"
 SERVER_READ_UNORDERED="${SERVER_READ_UNORDERED:-0}"
 
 THROUGHPUT_DURATION_SECS="${THROUGHPUT_DURATION_SECS:-10}"
@@ -34,8 +35,11 @@ MIXED_WARMUP_SECS="${MIXED_WARMUP_SECS:-2}"
 # PERF_BIN="sudo perf" instead would leave perf unkillable by the script.)
 PERF_LOCK="${PERF_LOCK:-auto}"
 PERF_BIN="${PERF_BIN:-perf}"
-PERF_LOCK_ARGS="${PERF_LOCK_ARGS:--ab}"
 PERF_LOCK_TOP="${PERF_LOCK_TOP:-16}"
+# bpf: live `perf lock con -ab` (needs perf built with BUILD_BPF_SKEL=1).
+# record: `perf lock record -a` + offline `perf lock contention -i` (needs the
+# lock:contention_begin/end tracepoints, kernel >= 5.19). auto picks bpf if available.
+PERF_LOCK_MODE="${PERF_LOCK_MODE:-auto}"
 
 if [[ -n "${NEW_CONN_DURATION_SECS:-}" ]]; then
     CHURN_DURATION_SECS="$NEW_CONN_DURATION_SECS"
@@ -50,6 +54,8 @@ SERVER_PID=""
 CHURN_PID=""
 PERF_LOCK_PID=""
 PERF_TRACE_PID=""
+PERF_LOCK_DATA=""
+PERF_LOCK_LOG=""
 
 cleanup() {
     stop_perf
@@ -83,6 +89,7 @@ start_server() {
         --initial-mtu "$SERVER_INITIAL_MTU"
         --max-concurrent-uni-streams "$SERVER_MAX_CONCURRENT_UNI_STREAMS"
         --max-concurrent-handshakes "$SERVER_MAX_CONCURRENT_HANDSHAKES"
+        --handshake-threads "$SERVER_HANDSHAKE_THREADS"
     )
     if [[ "$SERVER_READ_UNORDERED" == "1" ]]; then
         args+=(--read-unordered)
@@ -90,6 +97,13 @@ start_server() {
     "$SERVER_BIN" "${args[@]}" >"$log_file" 2>&1 &
     SERVER_PID="$!"
     sleep 1
+    # A dead server here usually means the listen port is taken by a leftover server
+    # from an earlier run; without this check the clients silently measure against it.
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "server failed to start:" >&2
+        cat "$log_file" >&2
+        exit 1
+    fi
 }
 
 stop_server() {
@@ -142,18 +156,34 @@ perf_enabled() {
     esac
 }
 
+resolve_perf_lock_mode() {
+    [[ "$PERF_LOCK_MODE" == "auto" ]] || return 0
+    if $PERF_BIN lock con -ab -E 1 -- true >/dev/null 2>&1; then
+        PERF_LOCK_MODE="bpf"
+    else
+        PERF_LOCK_MODE="record"
+    fi
+}
+
 # Sample kernel lock contention (system-wide) plus the server's futex blocking while
 # the throughput client runs. `perf lock con` only sees kernel locks (UDP socket lock
 # etc.); waits on the user-space endpoint mutex surface as futex syscalls instead,
 # which the `perf trace` summary reports per server thread. Both run until SIGINT,
-# which is what makes perf print its report.
+# which is what makes perf finalize its data and print.
 start_perf() {
     local lock_log="$1"
     local futex_log="$2"
     perf_enabled || return 0
-    # shellcheck disable=SC2086
-    $PERF_BIN lock con $PERF_LOCK_ARGS -E "$PERF_LOCK_TOP" >"$lock_log" 2>&1 &
-    PERF_LOCK_PID="$!"
+    resolve_perf_lock_mode
+    PERF_LOCK_LOG="$lock_log"
+    if [[ "$PERF_LOCK_MODE" == "bpf" ]]; then
+        $PERF_BIN lock con -ab -E "$PERF_LOCK_TOP" >"$lock_log" 2>&1 &
+        PERF_LOCK_PID="$!"
+    else
+        PERF_LOCK_DATA="$lock_log.data"
+        $PERF_BIN lock record -a -o "$PERF_LOCK_DATA" >"$lock_log" 2>&1 &
+        PERF_LOCK_PID="$!"
+    fi
     $PERF_BIN trace -p "$SERVER_PID" -e futex --summary >"$futex_log" 2>&1 &
     PERF_TRACE_PID="$!"
     # Give perf a moment to attach before the measured window starts
@@ -165,6 +195,13 @@ stop_perf() {
         kill -INT "$PERF_LOCK_PID" >/dev/null 2>&1 || true
         wait "$PERF_LOCK_PID" >/dev/null 2>&1 || true
         PERF_LOCK_PID=""
+        if [[ "$PERF_LOCK_MODE" == "record" && -s "$PERF_LOCK_DATA" ]]; then
+            $PERF_BIN lock contention -i "$PERF_LOCK_DATA" -E "$PERF_LOCK_TOP" \
+                >"$PERF_LOCK_LOG" 2>&1 || true
+            rm -f "$PERF_LOCK_DATA"
+        fi
+        PERF_LOCK_DATA=""
+        PERF_LOCK_LOG=""
     fi
     if [[ -n "$PERF_TRACE_PID" ]]; then
         kill -INT "$PERF_TRACE_PID" >/dev/null 2>&1 || true
@@ -293,6 +330,8 @@ printf 'mixed client loss:    %s packets, %s congestion events, %s system-wide u
     "$mixed_lost" "$mixed_congestion" "$mixed_udp_drops"
 printf 'mixed connect latency: p50=%sms p99=%sms max=%sms\n' \
     "$mixed_connect_p50" "$mixed_connect_p99" "$mixed_connect_max"
+mixed_accept_timing="$(grep accept_timing "$mixed_server_log" | tail -1 || true)"
+printf 'server accept timing:  %s\n' "${mixed_accept_timing:-n/a}"
 
 print_perf_section "baseline" "$baseline_perf_lock_log" "$baseline_perf_futex_log"
 print_perf_section "mixed" "$mixed_perf_lock_log" "$mixed_perf_futex_log"

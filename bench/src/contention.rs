@@ -1,13 +1,42 @@
 use std::{
+    future::Future,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::ParseIntError,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+/// A quinn runtime that pins all quinn-internal tasks (the endpoint driver and every
+/// connection driver) to a fixed tokio runtime. The stock `TokioRuntime` spawns onto the
+/// *calling thread's* ambient runtime, so when `Incoming::accept()` runs on a dedicated
+/// handshake runtime the accepted connection's driver — and with it all of the connection's
+/// packet processing — would follow it there. This wrapper keeps the data plane where it
+/// belongs regardless of which runtime triggers the spawn.
+#[derive(Debug)]
+pub struct PinnedRuntime(tokio::runtime::Handle);
+
+impl quinn::Runtime for PinnedRuntime {
+    fn new_timer(&self, i: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+        let _guard = self.0.enter();
+        quinn::TokioRuntime.new_timer(i)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        self.0.spawn(future);
+    }
+
+    fn wrap_udp_socket(&self, t: std::net::UdpSocket) -> io::Result<Box<dyn quinn::AsyncUdpSocket>> {
+        let _guard = self.0.enter();
+        quinn::TokioRuntime.wrap_udp_socket(t)
+    }
+}
 
 pub fn bind_addr_for(remote: SocketAddr) -> SocketAddr {
     let ip = match remote {
@@ -54,8 +83,10 @@ pub fn make_transport_config(
     config
 }
 
+/// Create the server endpoint with quinn-internal tasks pinned to the runtime behind
+/// `data_handle` (see [`PinnedRuntime`]).
 pub fn server_endpoint(
-    rt: &tokio::runtime::Runtime,
+    data_handle: tokio::runtime::Handle,
     listen: SocketAddr,
     initial_mtu: u16,
     max_concurrent_uni_streams: u64,
@@ -70,12 +101,14 @@ pub fn server_endpoint(
         max_concurrent_uni_streams,
     ));
 
-    let endpoint = {
-        let _guard = rt.enter();
-        quinn::Endpoint::server(server_config, listen)
-            .context("unable to create server endpoint")?
-    };
-    Ok(endpoint)
+    let socket = std::net::UdpSocket::bind(listen).context("binding server socket")?;
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_config),
+        socket,
+        Arc::new(PinnedRuntime(data_handle)),
+    )
+    .context("unable to create server endpoint")
 }
 
 pub fn client_endpoint(
