@@ -185,6 +185,8 @@ mixed_tput="$(extract_value throughput_mib_per_s "$mixed_throughput_log")"
 baseline_elapsed="$(extract_value elapsed_secs "$baseline_throughput_log")"
 mixed_elapsed="$(extract_value elapsed_secs "$mixed_throughput_log")"
 mixed_rate="$(extract_value achieved_connections_per_second "$mixed_new_conn_log")"
+mixed_rate_actual="$(extract_value actual_connections_per_second "$mixed_new_conn_log")"
+mixed_churn_wall="$(extract_value wall_elapsed_secs "$mixed_new_conn_log")"
 baseline_lost="$(extract_value lost_packets "$baseline_throughput_log")"
 mixed_lost="$(extract_value lost_packets "$mixed_throughput_log")"
 baseline_congestion="$(extract_value congestion_events "$baseline_throughput_log")"
@@ -204,7 +206,8 @@ degradation="$(awk -v baseline="$baseline_tput" -v mixed="$mixed_tput" 'BEGIN {
 printf '\nSummary\n'
 printf 'baseline throughput: %s MiB/s (elapsed %ss)\n' "$baseline_tput" "$baseline_elapsed"
 printf 'mixed throughput:    %s MiB/s (elapsed %ss)\n' "$mixed_tput" "$mixed_elapsed"
-printf 'mixed new-conn rate: %s /s\n' "$mixed_rate"
+printf 'mixed new-conn rate: %s /s scheduled, %s /s actual (busy for %ss)\n' \
+    "$mixed_rate" "$mixed_rate_actual" "$mixed_churn_wall"
 printf 'degradation:         %s%%\n' "$degradation"
 printf 'baseline client loss: %s packets, %s congestion events, %s system-wide udp rx drops\n' \
     "$baseline_lost" "$baseline_congestion" "$baseline_udp_drops"

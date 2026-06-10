@@ -36,15 +36,25 @@ fn main() -> Result<()> {
 
     let mut connections = 0_u64;
     let mut latencies = Vec::new();
+    let mut wall_elapsed = Duration::ZERO;
     for thread in threads {
-        let worker_latencies = thread.join().expect("new-client thread")?;
+        let (worker_latencies, worker_elapsed) = thread.join().expect("new-client thread")?;
         connections += worker_latencies.len() as u64;
         latencies.extend(worker_latencies);
+        wall_elapsed = wall_elapsed.max(worker_elapsed);
     }
     latencies.sort_unstable();
 
     let duration = Duration::from_secs(opt.duration_secs);
+    // Scheduled rate: connections divided by the configured duration. Misleading when workers
+    // fall behind schedule (they complete all scheduled attempts late instead of skipping).
     let achieved = connections as f64 / duration.as_secs_f64();
+    // Actual rate: connections divided by the wall-clock time the workers were connecting.
+    let actual = if wall_elapsed.is_zero() {
+        0.0
+    } else {
+        connections as f64 / wall_elapsed.as_secs_f64()
+    };
 
     println!("duration_secs={}", opt.duration_secs);
     println!(
@@ -54,6 +64,8 @@ fn main() -> Result<()> {
     println!("workers={}", opt.workers);
     println!("connections={}", connections);
     println!("achieved_connections_per_second={achieved:.2}");
+    println!("wall_elapsed_secs={:.3}", wall_elapsed.as_secs_f64());
+    println!("actual_connections_per_second={actual:.2}");
     println!(
         "connect_latency_p50_ms={:.3}",
         percentile(&latencies, 0.50).as_secs_f64() * 1000.0
@@ -82,10 +94,14 @@ fn percentile(sorted: &[Duration], q: f64) -> Duration {
     sorted[idx]
 }
 
-fn run_worker(opt: Opt, barrier: Arc<Barrier>, worker_index: usize) -> Result<Vec<Duration>> {
+fn run_worker(
+    opt: Opt,
+    barrier: Arc<Barrier>,
+    worker_index: usize,
+) -> Result<(Vec<Duration>, Duration)> {
     let rate = opt.connections_per_second as f64 / opt.workers as f64;
     if rate == 0.0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Duration::ZERO));
     }
 
     let runtime = rt();
@@ -121,8 +137,9 @@ fn run_worker(opt: Opt, barrier: Arc<Barrier>, worker_index: usize) -> Result<Ve
             next_attempt += interval;
         }
 
+        let active = start.elapsed();
         endpoint.wait_idle().await;
-        Ok(latencies)
+        Ok((latencies, active))
     })
 }
 
