@@ -35,9 +35,13 @@ fn main() -> Result<()> {
     }
 
     let mut connections = 0_u64;
+    let mut latencies = Vec::new();
     for thread in threads {
-        connections += thread.join().expect("new-client thread")?;
+        let worker_latencies = thread.join().expect("new-client thread")?;
+        connections += worker_latencies.len() as u64;
+        latencies.extend(worker_latencies);
     }
+    latencies.sort_unstable();
 
     let duration = Duration::from_secs(opt.duration_secs);
     let achieved = connections as f64 / duration.as_secs_f64();
@@ -50,14 +54,38 @@ fn main() -> Result<()> {
     println!("workers={}", opt.workers);
     println!("connections={}", connections);
     println!("achieved_connections_per_second={achieved:.2}");
+    println!(
+        "connect_latency_p50_ms={:.3}",
+        percentile(&latencies, 0.50).as_secs_f64() * 1000.0
+    );
+    println!(
+        "connect_latency_p90_ms={:.3}",
+        percentile(&latencies, 0.90).as_secs_f64() * 1000.0
+    );
+    println!(
+        "connect_latency_p99_ms={:.3}",
+        percentile(&latencies, 0.99).as_secs_f64() * 1000.0
+    );
+    println!(
+        "connect_latency_max_ms={:.3}",
+        latencies.last().copied().unwrap_or_default().as_secs_f64() * 1000.0
+    );
 
     Ok(())
 }
 
-fn run_worker(opt: Opt, barrier: Arc<Barrier>, worker_index: usize) -> Result<u64> {
+fn percentile(sorted: &[Duration], q: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
+    sorted[idx]
+}
+
+fn run_worker(opt: Opt, barrier: Arc<Barrier>, worker_index: usize) -> Result<Vec<Duration>> {
     let rate = opt.connections_per_second as f64 / opt.workers as f64;
     if rate == 0.0 {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     let runtime = rt();
@@ -74,7 +102,7 @@ fn run_worker(opt: Opt, barrier: Arc<Barrier>, worker_index: usize) -> Result<u6
             + Duration::from_nanos(
                 ((interval.as_nanos() / opt.workers as u128) * worker_index as u128) as u64,
             );
-        let mut completed = 0_u64;
+        let mut latencies = Vec::new();
 
         while next_attempt < stop_at {
             let now = Instant::now();
@@ -82,18 +110,19 @@ fn run_worker(opt: Opt, barrier: Arc<Barrier>, worker_index: usize) -> Result<u6
                 std::thread::sleep(next_attempt - now);
             }
 
+            let connect_start = Instant::now();
             let connection = endpoint
                 .connect_with(client_config.clone(), opt.connect, "localhost")
                 .unwrap()
                 .await
                 .context("unable to connect churn client")?;
+            latencies.push(connect_start.elapsed());
             connection.close(0u32.into(), b"churn");
-            completed += 1;
             next_attempt += interval;
         }
 
         endpoint.wait_idle().await;
-        Ok(completed)
+        Ok(latencies)
     })
 }
 

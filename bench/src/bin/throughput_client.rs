@@ -27,11 +27,26 @@ fn main() -> Result<()> {
     let mut total_bytes = 0_u64;
     let mut total_streams = 0_u64;
     let mut elapsed = Duration::ZERO;
+    let mut sent_packets = 0_u64;
+    let mut lost_packets = 0_u64;
+    let mut lost_bytes = 0_u64;
+    let mut congestion_events = 0_u64;
+    let mut spurious_congestion_events = 0_u64;
+    let mut rtt_max = Duration::ZERO;
+    let mut cwnd_min = u64::MAX;
     for thread in threads {
         let result = thread.join().expect("throughput-client thread")?;
         total_bytes += result.bytes;
         total_streams += result.streams;
         elapsed = elapsed.max(result.elapsed);
+        let path = result.stats.path;
+        sent_packets += path.sent_packets;
+        lost_packets += path.lost_packets;
+        lost_bytes += path.lost_bytes;
+        congestion_events += path.congestion_events;
+        spurious_congestion_events += path.spurious_congestion_events;
+        rtt_max = rtt_max.max(path.rtt);
+        cwnd_min = cwnd_min.min(path.cwnd);
     }
 
     let mib_per_s = if elapsed.is_zero() {
@@ -51,6 +66,16 @@ fn main() -> Result<()> {
     println!("bytes={}", total_bytes);
     println!("streams={}", total_streams);
     println!("throughput_mib_per_s={mib_per_s:.2}");
+    println!("sent_packets={sent_packets}");
+    println!("lost_packets={lost_packets}");
+    println!("lost_bytes={lost_bytes}");
+    println!("congestion_events={congestion_events}");
+    println!("spurious_congestion_events={spurious_congestion_events}");
+    println!("rtt_max_ms={:.3}", rtt_max.as_secs_f64() * 1000.0);
+    println!(
+        "cwnd_min_bytes={}",
+        if cwnd_min == u64::MAX { 0 } else { cwnd_min }
+    );
 
     Ok(())
 }
@@ -115,6 +140,7 @@ fn run_connection(opt: Opt, barrier: Arc<Barrier>) -> Result<ConnectionResult> {
             task.await.context("throughput-client task panicked")??;
         }
 
+        let stats = connection.stats();
         connection.close(0u32.into(), b"throughput done");
         endpoint.wait_idle().await;
 
@@ -122,6 +148,7 @@ fn run_connection(opt: Opt, barrier: Arc<Barrier>) -> Result<ConnectionResult> {
             bytes: bytes.load(Ordering::Relaxed),
             streams: streams.load(Ordering::Relaxed),
             elapsed: start.elapsed(),
+            stats,
         })
     })
 }
@@ -151,4 +178,5 @@ struct ConnectionResult {
     bytes: u64,
     streams: u64,
     elapsed: Duration,
+    stats: quinn::ConnectionStats,
 }

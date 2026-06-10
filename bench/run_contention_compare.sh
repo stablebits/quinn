@@ -92,6 +92,31 @@ extract_value() {
     awk -F= -v key="$key" '$1 == key { print $2; exit }' "$file"
 }
 
+# System-wide UDP receive drop counter (socket buffer overflows). A rising delta during a
+# phase means a receiver (here: the server endpoint driver) was not draining its socket
+# fast enough and the kernel dropped datagrams.
+udp_recv_drops() {
+    case "$(uname -s)" in
+        Linux)
+            awk '/^Udp:/ {
+                if (!header_seen) {
+                    for (i = 1; i <= NF; i++) col[$i] = i
+                    header_seen = 1
+                } else {
+                    print $col["InErrors"] + $col["RcvbufErrors"]
+                }
+            }' /proc/net/snmp
+            ;;
+        Darwin)
+            netstat -s -p udp | awk '/dropped due to full socket buffers/ { print $1; found = 1 }
+                END { if (!found) print 0 }'
+            ;;
+        *)
+            echo 0
+            ;;
+    esac
+}
+
 baseline_server_log="$TMP_DIR/server_baseline.log"
 mixed_server_log="$TMP_DIR/server_mixed.log"
 baseline_throughput_log="$TMP_DIR/throughput_baseline.log"
@@ -136,12 +161,15 @@ mixed_new_conn_args=(
     --initial-mtu "$NEW_CONN_INITIAL_MTU"
 )
 
+drops_before="$(udp_recv_drops)"
 start_server "$baseline_server_log"
 "$THROUGHPUT_BIN" "${baseline_args[@]}" | tee "$baseline_throughput_log"
 stop_server
+baseline_udp_drops="$(($(udp_recv_drops) - drops_before))"
 
 printf '\n'
 
+drops_before="$(udp_recv_drops)"
 start_server "$mixed_server_log"
 "$NEW_CONN_BIN" "${mixed_new_conn_args[@]}" >"$mixed_new_conn_log" 2>&1 &
 CHURN_PID="$!"
@@ -150,12 +178,20 @@ sleep "$MIXED_WARMUP_SECS"
 wait "$CHURN_PID"
 CHURN_PID=""
 stop_server
+mixed_udp_drops="$(($(udp_recv_drops) - drops_before))"
 
 baseline_tput="$(extract_value throughput_mib_per_s "$baseline_throughput_log")"
 mixed_tput="$(extract_value throughput_mib_per_s "$mixed_throughput_log")"
 baseline_elapsed="$(extract_value elapsed_secs "$baseline_throughput_log")"
 mixed_elapsed="$(extract_value elapsed_secs "$mixed_throughput_log")"
 mixed_rate="$(extract_value achieved_connections_per_second "$mixed_new_conn_log")"
+baseline_lost="$(extract_value lost_packets "$baseline_throughput_log")"
+mixed_lost="$(extract_value lost_packets "$mixed_throughput_log")"
+baseline_congestion="$(extract_value congestion_events "$baseline_throughput_log")"
+mixed_congestion="$(extract_value congestion_events "$mixed_throughput_log")"
+mixed_connect_p50="$(extract_value connect_latency_p50_ms "$mixed_new_conn_log")"
+mixed_connect_p99="$(extract_value connect_latency_p99_ms "$mixed_new_conn_log")"
+mixed_connect_max="$(extract_value connect_latency_max_ms "$mixed_new_conn_log")"
 
 degradation="$(awk -v baseline="$baseline_tput" -v mixed="$mixed_tput" 'BEGIN {
     if (baseline == 0) {
@@ -170,3 +206,9 @@ printf 'baseline throughput: %s MiB/s (elapsed %ss)\n' "$baseline_tput" "$baseli
 printf 'mixed throughput:    %s MiB/s (elapsed %ss)\n' "$mixed_tput" "$mixed_elapsed"
 printf 'mixed new-conn rate: %s /s\n' "$mixed_rate"
 printf 'degradation:         %s%%\n' "$degradation"
+printf 'baseline client loss: %s packets, %s congestion events, %s system-wide udp rx drops\n' \
+    "$baseline_lost" "$baseline_congestion" "$baseline_udp_drops"
+printf 'mixed client loss:    %s packets, %s congestion events, %s system-wide udp rx drops\n' \
+    "$mixed_lost" "$mixed_congestion" "$mixed_udp_drops"
+printf 'mixed connect latency: p50=%sms p99=%sms max=%sms\n' \
+    "$mixed_connect_p50" "$mixed_connect_p99" "$mixed_connect_max"
