@@ -13,6 +13,7 @@ LISTEN="${LISTEN:-127.0.0.1:4433}"
 SERVER_WORKER_THREADS="${SERVER_WORKER_THREADS:-8}"
 SERVER_INITIAL_MTU="${SERVER_INITIAL_MTU:-1200}"
 SERVER_MAX_CONCURRENT_UNI_STREAMS="${SERVER_MAX_CONCURRENT_UNI_STREAMS:-131072}"
+SERVER_MAX_CONCURRENT_HANDSHAKES="${SERVER_MAX_CONCURRENT_HANDSHAKES:-0}"
 SERVER_READ_UNORDERED="${SERVER_READ_UNORDERED:-0}"
 
 THROUGHPUT_DURATION_SECS="${THROUGHPUT_DURATION_SECS:-10}"
@@ -27,6 +28,15 @@ NEW_CONN_WORKERS="${NEW_CONN_WORKERS:-16}"
 NEW_CONN_INITIAL_MTU="${NEW_CONN_INITIAL_MTU:-1200}"
 MIXED_WARMUP_SECS="${MIXED_WARMUP_SECS:-2}"
 
+# perf sampling of the throughput window (Linux only). PERF_LOCK=auto enables it
+# when `perf` is available; set to 1/0 to force. BPF lock contention (-b) and
+# tracepoints usually need root: run the whole script via sudo. (Setting
+# PERF_BIN="sudo perf" instead would leave perf unkillable by the script.)
+PERF_LOCK="${PERF_LOCK:-auto}"
+PERF_BIN="${PERF_BIN:-perf}"
+PERF_LOCK_ARGS="${PERF_LOCK_ARGS:--ab}"
+PERF_LOCK_TOP="${PERF_LOCK_TOP:-16}"
+
 if [[ -n "${NEW_CONN_DURATION_SECS:-}" ]]; then
     CHURN_DURATION_SECS="$NEW_CONN_DURATION_SECS"
 elif [[ "$THROUGHPUT_STREAM_RUNS" == "0" ]]; then
@@ -38,8 +48,11 @@ fi
 TMP_DIR="$(mktemp -d)"
 SERVER_PID=""
 CHURN_PID=""
+PERF_LOCK_PID=""
+PERF_TRACE_PID=""
 
 cleanup() {
+    stop_perf
     if [[ -n "$CHURN_PID" ]]; then
         kill "$CHURN_PID" >/dev/null 2>&1 || true
         wait "$CHURN_PID" >/dev/null 2>&1 || true
@@ -69,6 +82,7 @@ start_server() {
         --worker-threads "$SERVER_WORKER_THREADS"
         --initial-mtu "$SERVER_INITIAL_MTU"
         --max-concurrent-uni-streams "$SERVER_MAX_CONCURRENT_UNI_STREAMS"
+        --max-concurrent-handshakes "$SERVER_MAX_CONCURRENT_HANDSHAKES"
     )
     if [[ "$SERVER_READ_UNORDERED" == "1" ]]; then
         args+=(--read-unordered)
@@ -117,11 +131,71 @@ udp_recv_drops() {
     esac
 }
 
+perf_enabled() {
+    case "$PERF_LOCK" in
+        1) return 0 ;;
+        0) return 1 ;;
+        *)
+            [[ "$(uname -s)" == "Linux" ]] || return 1
+            command -v "${PERF_BIN%% *}" >/dev/null 2>&1 || return 1
+            ;;
+    esac
+}
+
+# Sample kernel lock contention (system-wide) plus the server's futex blocking while
+# the throughput client runs. `perf lock con` only sees kernel locks (UDP socket lock
+# etc.); waits on the user-space endpoint mutex surface as futex syscalls instead,
+# which the `perf trace` summary reports per server thread. Both run until SIGINT,
+# which is what makes perf print its report.
+start_perf() {
+    local lock_log="$1"
+    local futex_log="$2"
+    perf_enabled || return 0
+    # shellcheck disable=SC2086
+    $PERF_BIN lock con $PERF_LOCK_ARGS -E "$PERF_LOCK_TOP" >"$lock_log" 2>&1 &
+    PERF_LOCK_PID="$!"
+    $PERF_BIN trace -p "$SERVER_PID" -e futex --summary >"$futex_log" 2>&1 &
+    PERF_TRACE_PID="$!"
+    # Give perf a moment to attach before the measured window starts
+    sleep 0.3
+}
+
+stop_perf() {
+    if [[ -n "$PERF_LOCK_PID" ]]; then
+        kill -INT "$PERF_LOCK_PID" >/dev/null 2>&1 || true
+        wait "$PERF_LOCK_PID" >/dev/null 2>&1 || true
+        PERF_LOCK_PID=""
+    fi
+    if [[ -n "$PERF_TRACE_PID" ]]; then
+        kill -INT "$PERF_TRACE_PID" >/dev/null 2>&1 || true
+        wait "$PERF_TRACE_PID" >/dev/null 2>&1 || true
+        PERF_TRACE_PID=""
+    fi
+}
+
+print_perf_section() {
+    local title="$1"
+    local lock_log="$2"
+    local futex_log="$3"
+    perf_enabled || return 0
+    printf '\nperf lock contention (%s, kernel locks, top %s):\n' "$title" "$PERF_LOCK_TOP"
+    cat "$lock_log"
+    printf '\nserver futex blocking (%s, per thread):\n' "$title"
+    grep -E 'events|futex' "$futex_log" || cat "$futex_log"
+    if grep -qiE 'permission|not permitted|capabilit|privilege' "$lock_log" "$futex_log"; then
+        printf 'hint: perf needs privileges; re-run this script via sudo.\n'
+    fi
+}
+
 baseline_server_log="$TMP_DIR/server_baseline.log"
 mixed_server_log="$TMP_DIR/server_mixed.log"
 baseline_throughput_log="$TMP_DIR/throughput_baseline.log"
 mixed_throughput_log="$TMP_DIR/throughput_mixed.log"
 mixed_new_conn_log="$TMP_DIR/new_conn_mixed.log"
+baseline_perf_lock_log="$TMP_DIR/perf_lock_baseline.log"
+baseline_perf_futex_log="$TMP_DIR/perf_futex_baseline.log"
+mixed_perf_lock_log="$TMP_DIR/perf_lock_mixed.log"
+mixed_perf_futex_log="$TMP_DIR/perf_futex_mixed.log"
 
 require_bin "$SERVER_BIN"
 require_bin "$THROUGHPUT_BIN"
@@ -163,7 +237,9 @@ mixed_new_conn_args=(
 
 drops_before="$(udp_recv_drops)"
 start_server "$baseline_server_log"
+start_perf "$baseline_perf_lock_log" "$baseline_perf_futex_log"
 "$THROUGHPUT_BIN" "${baseline_args[@]}" | tee "$baseline_throughput_log"
+stop_perf
 stop_server
 baseline_udp_drops="$(($(udp_recv_drops) - drops_before))"
 
@@ -174,7 +250,9 @@ start_server "$mixed_server_log"
 "$NEW_CONN_BIN" "${mixed_new_conn_args[@]}" >"$mixed_new_conn_log" 2>&1 &
 CHURN_PID="$!"
 sleep "$MIXED_WARMUP_SECS"
+start_perf "$mixed_perf_lock_log" "$mixed_perf_futex_log"
 "$THROUGHPUT_BIN" "${baseline_args[@]}" | tee "$mixed_throughput_log"
+stop_perf
 wait "$CHURN_PID"
 CHURN_PID=""
 stop_server
@@ -215,3 +293,6 @@ printf 'mixed client loss:    %s packets, %s congestion events, %s system-wide u
     "$mixed_lost" "$mixed_congestion" "$mixed_udp_drops"
 printf 'mixed connect latency: p50=%sms p99=%sms max=%sms\n' \
     "$mixed_connect_p50" "$mixed_connect_p99" "$mixed_connect_max"
+
+print_perf_section "baseline" "$baseline_perf_lock_log" "$baseline_perf_futex_log"
+print_perf_section "mixed" "$mixed_perf_lock_log" "$mixed_perf_futex_log"
