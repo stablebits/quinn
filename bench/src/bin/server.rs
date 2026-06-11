@@ -53,6 +53,7 @@ fn main() -> Result<()> {
         opt.listen,
         opt.initial_mtu,
         opt.max_concurrent_uni_streams,
+        matches!(opt.cert_alg, CertAlg::Ed25519),
     )?;
     info!("listening on {}", endpoint.local_addr()?);
 
@@ -150,6 +151,17 @@ struct Opt {
     /// with this many threads (0 = use the shared data runtime)
     #[arg(long, default_value = "0")]
     handshake_threads: usize,
+    /// Server certificate algorithm (ed25519 mirrors agave)
+    #[arg(long, value_enum, default_value_t = CertAlg::Ecdsa)]
+    cert_alg: CertAlg,
     #[arg(long)]
     read_unordered: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum CertAlg {
+    /// ECDSA P-256 (rcgen default)
+    Ecdsa,
+    /// Ed25519 (what agave serves, derived from the validator identity key)
+    Ed25519,
 }

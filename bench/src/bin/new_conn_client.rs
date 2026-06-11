@@ -1,6 +1,9 @@
 use std::{
     net::SocketAddr,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -8,9 +11,22 @@ use anyhow::{Context, Result};
 use bench::{configure_tracing_subscriber, contention, rt};
 use clap::Parser;
 
+/// Set by SIGTERM/SIGINT: workers finish their in-flight connect and stop, so the run can
+/// be truncated externally (e.g. right after the measured download window) while still
+/// reporting stats for exactly the truncated period.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop_handler(_sig: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
 fn main() -> Result<()> {
     let opt = Opt::parse();
     configure_tracing_subscriber();
+    unsafe {
+        libc::signal(libc::SIGTERM, stop_handler as usize);
+        libc::signal(libc::SIGINT, stop_handler as usize);
+    }
 
     if opt.connections_per_second == 0 || opt.workers == 0 {
         println!("duration_secs={}", opt.duration_secs);
@@ -120,10 +136,18 @@ fn run_worker(
             );
         let mut latencies = Vec::new();
 
-        while next_attempt < stop_at {
-            let now = Instant::now();
-            if next_attempt > now {
-                std::thread::sleep(next_attempt - now);
+        'attempts: while next_attempt < stop_at {
+            // Sleep in short chunks so an external stop signal is honored promptly even
+            // at low rates (long inter-attempt intervals).
+            loop {
+                if STOP.load(Ordering::Relaxed) {
+                    break 'attempts;
+                }
+                let now = Instant::now();
+                if next_attempt <= now {
+                    break;
+                }
+                std::thread::sleep((next_attempt - now).min(Duration::from_millis(50)));
             }
 
             let connect_start = Instant::now();

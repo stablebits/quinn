@@ -12,22 +12,31 @@ NEW_CONN_BIN="$BIN_DIR/new-conn-client"
 LISTEN="${LISTEN:-127.0.0.1:4433}"
 SERVER_WORKER_THREADS="${SERVER_WORKER_THREADS:-8}"
 SERVER_INITIAL_MTU="${SERVER_INITIAL_MTU:-1200}"
-SERVER_MAX_CONCURRENT_UNI_STREAMS="${SERVER_MAX_CONCURRENT_UNI_STREAMS:-131072}"
+SERVER_MAX_CONCURRENT_UNI_STREAMS="${SERVER_MAX_CONCURRENT_UNI_STREAMS:-10000}"
 SERVER_MAX_CONCURRENT_HANDSHAKES="${SERVER_MAX_CONCURRENT_HANDSHAKES:-0}"
 SERVER_HANDSHAKE_THREADS="${SERVER_HANDSHAKE_THREADS:-0}"
+SERVER_CERT_ALG="${SERVER_CERT_ALG:-ecdsa}"
 SERVER_READ_UNORDERED="${SERVER_READ_UNORDERED:-0}"
 
+# The throughput test runs for a fixed wall-clock interval (THROUGHPUT_DURATION_SECS),
+# sending THROUGHPUT_STREAM_SIZE-sized streams back to back, so the measured window is
+# the same on fast and slow machines. Set THROUGHPUT_STREAM_RUNS=N to instead send a
+# fixed number of streams (the old fixed-size mode); the deadline is only checked
+# between streams, so keep the stream size small in timed mode.
 THROUGHPUT_DURATION_SECS="${THROUGHPUT_DURATION_SECS:-10}"
 THROUGHPUT_CONNECTIONS="${THROUGHPUT_CONNECTIONS:-1}"
 THROUGHPUT_STREAMS_PER_CONNECTION="${THROUGHPUT_STREAMS_PER_CONNECTION:-1}"
-THROUGHPUT_STREAM_SIZE="${THROUGHPUT_STREAM_SIZE:-1600M}"
-THROUGHPUT_STREAM_RUNS="${THROUGHPUT_STREAM_RUNS:-1}"
+THROUGHPUT_STREAM_SIZE="${THROUGHPUT_STREAM_SIZE:-64M}"
+THROUGHPUT_STREAM_RUNS="${THROUGHPUT_STREAM_RUNS:-0}"
 THROUGHPUT_INITIAL_MTU="${THROUGHPUT_INITIAL_MTU:-1200}"
 
 NEW_CONN_RATE="${NEW_CONN_RATE:-2500}"
 NEW_CONN_WORKERS="${NEW_CONN_WORKERS:-16}"
 NEW_CONN_INITIAL_MTU="${NEW_CONN_INITIAL_MTU:-1200}"
-MIXED_WARMUP_SECS="${MIXED_WARMUP_SECS:-2}"
+# The mixed phase starts the churn client and launches the throughput client right after;
+# the churn is stopped when the throughput window ends, so both are measured over the same
+# interval. MIXED_WARMUP_SECS optionally delays the throughput start.
+MIXED_WARMUP_SECS="${MIXED_WARMUP_SECS:-0}"
 
 # perf sampling of the throughput window (Linux only). PERF_LOCK=auto enables it
 # when `perf` is available; set to 1/0 to force. BPF lock contention (-b) and
@@ -90,6 +99,7 @@ start_server() {
         --max-concurrent-uni-streams "$SERVER_MAX_CONCURRENT_UNI_STREAMS"
         --max-concurrent-handshakes "$SERVER_MAX_CONCURRENT_HANDSHAKES"
         --handshake-threads "$SERVER_HANDSHAKE_THREADS"
+        --cert-alg "$SERVER_CERT_ALG"
     )
     if [[ "$SERVER_READ_UNORDERED" == "1" ]]; then
         args+=(--read-unordered)
@@ -290,6 +300,10 @@ sleep "$MIXED_WARMUP_SECS"
 start_perf "$mixed_perf_lock_log" "$mixed_perf_futex_log"
 "$THROUGHPUT_BIN" "${baseline_args[@]}" | tee "$mixed_throughput_log"
 stop_perf
+# The measured window is over; stop the churn client gracefully (SIGTERM) so its stats
+# cover only the warmup + download period instead of free-running to the end of its
+# schedule (which also made the script appear to hang here).
+kill "$CHURN_PID" >/dev/null 2>&1 || true
 wait "$CHURN_PID"
 CHURN_PID=""
 stop_server
@@ -299,9 +313,9 @@ baseline_tput="$(extract_value throughput_mib_per_s "$baseline_throughput_log")"
 mixed_tput="$(extract_value throughput_mib_per_s "$mixed_throughput_log")"
 baseline_elapsed="$(extract_value elapsed_secs "$baseline_throughput_log")"
 mixed_elapsed="$(extract_value elapsed_secs "$mixed_throughput_log")"
-mixed_rate="$(extract_value achieved_connections_per_second "$mixed_new_conn_log")"
 mixed_rate_actual="$(extract_value actual_connections_per_second "$mixed_new_conn_log")"
 mixed_churn_wall="$(extract_value wall_elapsed_secs "$mixed_new_conn_log")"
+mixed_churn_conns="$(extract_value connections "$mixed_new_conn_log")"
 baseline_lost="$(extract_value lost_packets "$baseline_throughput_log")"
 mixed_lost="$(extract_value lost_packets "$mixed_throughput_log")"
 baseline_congestion="$(extract_value congestion_events "$baseline_throughput_log")"
@@ -321,8 +335,8 @@ degradation="$(awk -v baseline="$baseline_tput" -v mixed="$mixed_tput" 'BEGIN {
 printf '\nSummary\n'
 printf 'baseline throughput: %s MiB/s (elapsed %ss)\n' "$baseline_tput" "$baseline_elapsed"
 printf 'mixed throughput:    %s MiB/s (elapsed %ss)\n' "$mixed_tput" "$mixed_elapsed"
-printf 'mixed new-conn rate: %s /s scheduled, %s /s actual (busy for %ss)\n' \
-    "$mixed_rate" "$mixed_rate_actual" "$mixed_churn_wall"
+printf 'mixed new-conn rate: %s /s actual, target %s /s (%s conns over %ss, stopped with download)\n' \
+    "$mixed_rate_actual" "$NEW_CONN_RATE" "$mixed_churn_conns" "$mixed_churn_wall"
 printf 'degradation:         %s%%\n' "$degradation"
 printf 'baseline client loss: %s packets, %s congestion events, %s system-wide udp rx drops\n' \
     "$baseline_lost" "$baseline_congestion" "$baseline_udp_drops"

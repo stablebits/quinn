@@ -85,15 +85,31 @@ pub fn make_transport_config(
 
 /// Create the server endpoint with quinn-internal tasks pinned to the runtime behind
 /// `data_handle` (see [`PinnedRuntime`]).
+///
+/// `ed25519_cert` serves a self-signed Ed25519 certificate (as agave does, built from the
+/// validator identity key) instead of rcgen's default ECDSA P-256.
 pub fn server_endpoint(
     data_handle: tokio::runtime::Handle,
     listen: SocketAddr,
     initial_mtu: u16,
     max_concurrent_uni_streams: u64,
+    ed25519_cert: bool,
 ) -> Result<quinn::Endpoint> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let cert = CertificateDer::from(cert.cert);
+    let (cert, key) = if ed25519_cert {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
+        let cert =
+            rcgen::CertificateParams::new(vec!["localhost".into()])?.self_signed(&key_pair)?;
+        (
+            cert.der().clone(),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        )
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (
+            CertificateDer::from(cert.cert),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+        )
+    };
 
     let mut server_config = quinn::ServerConfig::with_single_cert(vec![cert], key.into()).unwrap();
     server_config.transport = Arc::new(make_transport_config(
