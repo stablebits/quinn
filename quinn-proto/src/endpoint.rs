@@ -420,15 +420,24 @@ impl Endpoint {
         let dst_cid = event.first_decode.dst_cid();
         let header = event.first_decode.initial_header().unwrap();
 
-        let Some(server_config) = &self.server_config else {
+        if self.server_config.is_none() {
             debug!("packet for unrecognized connection {}", dst_cid);
             return self
                 .stateless_reset(event.now, datagram_len, addresses, dst_cid, buf)
                 .map(DatagramEvent::Response);
-        };
+        }
 
         if datagram_len < MIN_INITIAL_SIZE as usize {
             debug!("ignoring short initial for connection {}", dst_cid);
+            return None;
+        }
+
+        // Validate before deriving initial keys, so that rejected Initials (e.g. when the
+        // incoming queue is full) can be dropped without any cryptographic work or response,
+        // keeping the endpoint responsive under a flood of connection attempts.
+        let validity_check = self.early_validate_first_packet(header);
+        let server_config = self.server_config.as_ref().unwrap();
+        if validity_check.is_err() && !server_config.respond_to_rejected_initials {
             return None;
         }
 
@@ -445,7 +454,7 @@ impl Endpoint {
             }
         };
 
-        if let Err(reason) = self.early_validate_first_packet(header) {
+        if let Err(reason) = validity_check {
             return Some(DatagramEvent::Response(self.initial_close(
                 header.version,
                 addresses,

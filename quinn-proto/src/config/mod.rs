@@ -224,6 +224,7 @@ pub struct ServerConfig {
     pub(crate) max_incoming: usize,
     pub(crate) incoming_buffer_size: u64,
     pub(crate) incoming_buffer_size_total: u64,
+    pub(crate) respond_to_rejected_initials: bool,
 
     pub(crate) time_source: Arc<dyn TimeSource>,
 }
@@ -251,6 +252,7 @@ impl ServerConfig {
             max_incoming: 1 << 16,
             incoming_buffer_size: 10 << 20,
             incoming_buffer_size_total: 100 << 20,
+            respond_to_rejected_initials: false,
 
             time_source: Arc::new(StdSystemTime),
         }
@@ -355,6 +357,22 @@ impl ServerConfig {
     /// exhaustion in most contexts.
     pub fn incoming_buffer_size_total(&mut self, incoming_buffer_size_total: u64) -> &mut Self {
         self.incoming_buffer_size_total = incoming_buffer_size_total;
+        self
+    }
+
+    /// Whether to respond to Initial packets that are rejected before connection processing
+    /// begins, e.g. because the [`max_incoming`][Self::max_incoming] limit has been reached
+    ///
+    /// When enabled, a rejected Initial elicits an immediate close response (such as
+    /// CONNECTION_REFUSED), allowing well-behaved clients to fail fast. This requires deriving
+    /// the packet's initial keys, which is comparatively expensive. When disabled, rejected
+    /// Initials are dropped without performing any cryptographic work or sending a response;
+    /// clients will retransmit and eventually time out, but the endpoint stays responsive
+    /// under a flood of connection attempts.
+    ///
+    /// Enabled by default.
+    pub fn respond_to_rejected_initials(&mut self, value: bool) -> &mut Self {
+        self.respond_to_rejected_initials = value;
         self
     }
 
