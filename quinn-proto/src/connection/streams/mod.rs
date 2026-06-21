@@ -15,8 +15,8 @@ use crate::{
 };
 
 mod recv;
-use recv::Recv;
-pub use recv::{Chunks, ReadError, ReadableError};
+pub(crate) use recv::Recv;
+pub use recv::{Chunks, ReadError, ReadToEndError, ReadableError};
 
 mod send;
 pub(crate) use send::{ByteSlice, BytesArray};
@@ -78,6 +78,64 @@ impl<'a> Streams<'a> {
         Some(StreamId::new(!self.state.side, dir, x))
     }
 
+    /// Accept any remotely initiated unidirectional stream that has all its data available
+    ///
+    /// Unlike [`accept`](Self::accept), this returns streams out of order, and only those
+    /// that are already finished and have all their data buffered.
+    /// Note that this function accepts new streams while searching for a complete one.
+    ///
+    /// Returns `None` if there are no suitable streams.
+    pub fn accept_complete_uni(&mut self) -> Option<StreamId> {
+        // First check if any previously incomplete stream has become complete
+        self.state.complete_uni_streams.pop_front().or_else(|| {
+            // If no, check new streams
+            while let Some(id) = self.accept(Dir::Uni) {
+                if self.check_complete_or_track(id) {
+                    return Some(id);
+                }
+            }
+            None
+        })
+    }
+
+    /// Like [`accept_complete_uni`](Self::accept_complete_uni), but also removes and
+    /// returns the stream's Recv in one operation, avoiding a separate hash lookup.
+    pub(crate) fn accept_complete_uni_recv(&mut self) -> Option<(StreamId, Box<Recv>)> {
+        // First check the complete queue
+        if let Some(result) = self.state.take_complete_uni_recv() {
+            return Some(result);
+        }
+
+        // Check new streams
+        while let Some(id) = self.accept(Dir::Uni) {
+            if let Some(recv) = self.state.take_recv_if_complete(id) {
+                return Some((id, recv));
+            }
+        }
+        None
+    }
+
+    /// Check if a stream has all its data available. If not, mark it for tracking
+    /// so we get notified when it becomes complete.
+    fn check_complete_or_track(&mut self, id: StreamId) -> bool {
+        let Some(recv) = self
+            .state
+            .recv
+            .get_mut(&id)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_open_recv_mut())
+        else {
+            return false;
+        };
+
+        if recv.is_all_data_available() || !recv.is_receiving() {
+            true
+        } else {
+            recv.tracked_for_completion = true;
+            false
+        }
+    }
+
     #[cfg(fuzzing)]
     pub fn state(&mut self) -> &mut StreamsState {
         self.state
@@ -127,6 +185,36 @@ impl RecvStream<'_> {
     /// `ReadError::IllegalOrderedRead`.
     pub fn read(&mut self, ordered: bool) -> Result<Chunks<'_>, ReadableError> {
         Chunks::new(self.id, ordered, self.state, self.pending)
+    }
+
+    /// Read all available chunks from a finished stream into the provided Vec
+    ///
+    /// The Vec is cleared before reading. Pre-allocate with sufficient capacity to avoid
+    /// allocations in the common case.
+    ///
+    /// Returns `ShouldTransmit` indicating whether a packet should be sent (for flow control).
+    ///
+    /// Returns an error if the stream was reset or is not readable.
+    pub fn read_to_end(&mut self, out: &mut Vec<Bytes>) -> Result<ShouldTransmit, ReadToEndError> {
+        let mut chunks = self.read(true)?;
+
+        out.clear();
+
+        loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => {
+                    out.push(chunk.bytes);
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(chunks.finalize())
     }
 
     /// Stop accepting data on the given receive stream
@@ -489,6 +577,14 @@ pub enum StreamEvent {
     /// At least one new stream of a certain directionality may be opened
     Available {
         /// Directionality for which streams are newly available
+        dir: Dir,
+    },
+    /// At least one stream can be accepted with all its data (finished and fully buffered)
+    ///
+    /// This event is generated when a remotely initiated stream receives its final data,
+    /// allowing out-of-order processing via `accept_complete()`.
+    AcceptComplete {
+        /// Directionality for which streams are available
         dir: Dir,
     },
 }
