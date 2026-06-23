@@ -83,7 +83,7 @@ pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStre
 pub use crate::runtime::SmolRuntime;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
 pub use crate::runtime::default_runtime;
-pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender};
+pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, UdpSenderFactory};
 #[cfg(feature = "runtime-tokio")]
 pub use crate::runtime::{TokioRuntime, TokioRuntimeHandle};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};

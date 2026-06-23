@@ -22,7 +22,7 @@ use std::{
 use crate::runtime::default_runtime;
 use crate::{
     Instant,
-    runtime::{AsyncUdpSocket, Runtime, UdpSender},
+    runtime::{AsyncUdpSocket, Runtime, UdpSender, UdpSenderFactory},
     udp_transmit,
 };
 use bytes::{Bytes, BytesMut};
@@ -311,30 +311,40 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
+        let mut endpoint = self.inner.state.lock().unwrap();
+        if let Some(sender_factory) = endpoint.sender_factory.clone() {
+            return endpoint.connect(
+                self.runtime.now(),
+                config,
+                addr,
+                server_name,
+                || sender_factory.create_sender(),
+                self.runtime.clone(),
+            );
+        }
+        drop(endpoint);
+
         let recv_io = self.inner.recv_io.lock().unwrap();
         let mut endpoint = self.inner.state.lock().unwrap();
-        if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
-            return Err(ConnectError::EndpointStopping);
-        }
-        if addr.is_ipv6() && !endpoint.ipv6 {
-            return Err(ConnectError::InvalidRemoteAddress(addr));
-        }
-        let addr = if endpoint.ipv6 {
-            SocketAddr::V6(ensure_ipv6(addr))
+        if let Some(sender_factory) = endpoint.sender_factory.clone() {
+            endpoint.connect(
+                self.runtime.now(),
+                config,
+                addr,
+                server_name,
+                || sender_factory.create_sender(),
+                self.runtime.clone(),
+            )
         } else {
-            addr
-        };
-
-        let (ch, conn) = endpoint
-            .inner
-            .connect(self.runtime.now(), config, addr, server_name)?;
-
-        let sender = recv_io.socket.create_sender();
-        endpoint.stats.outgoing_handshakes += 1;
-        Ok(endpoint
-            .recv_state
-            .connections
-            .insert(ch, conn, sender, false, self.runtime.clone()))
+            endpoint.connect(
+                self.runtime.now(),
+                config,
+                addr,
+                server_name,
+                || recv_io.socket.create_sender(),
+                self.runtime.clone(),
+            )
+        }
     }
 
     /// Switch to a new UDP socket
@@ -353,16 +363,22 @@ impl Endpoint {
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
         let addr = socket.local_addr()?;
+        let sender_factory = socket.sender_factory();
         let mut recv_io = self.inner.recv_io.lock().unwrap();
         let mut inner = self.inner.state.lock().unwrap();
         recv_io.prev_socket = Some(mem::replace(&mut recv_io.socket, socket));
         inner.sender = recv_io.socket.create_sender();
+        inner.sender_factory = sender_factory;
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(recv_io.socket.create_sender()));
+            let new_sender = match &inner.sender_factory {
+                Some(sender_factory) => sender_factory.create_sender(),
+                None => recv_io.socket.create_sender(),
+            };
+            let _ = sender.send(ConnectionEvent::Rebind(new_sender));
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket
@@ -562,19 +578,24 @@ impl EndpointInner {
         let accepted = accepting.accept();
 
         // Phase 3: register the connection, or release the reservation, under the lock.
-        let recv_io = self.recv_io.lock().unwrap();
         let mut state = self.state.lock().unwrap();
+        let recv_io = if state.sender_factory.is_none() {
+            drop(state);
+            let recv_io = self.recv_io.lock().unwrap();
+            state = self.state.lock().unwrap();
+            Some(recv_io)
+        } else {
+            None
+        };
         state.pending_accepts -= 1;
         let result = match state.inner.finish_accept(accepted, &mut response_buffer) {
             Ok((handle, conn)) => {
-                state.stats.accepted_handshakes += 1;
-                let sender = recv_io.socket.create_sender();
-                let runtime = state.runtime.clone();
-                let driver_lost = state.driver_lost;
-                Ok(state
-                    .recv_state
-                    .connections
-                    .insert(handle, conn, sender, driver_lost, runtime))
+                if let Some(sender_factory) = state.sender_factory.clone() {
+                    Ok(state.finish_accept(handle, conn, || sender_factory.create_sender()))
+                } else {
+                    let recv_io = recv_io.as_ref().expect("socket locked without a sender factory");
+                    Ok(state.finish_accept(handle, conn, || recv_io.socket.create_sender()))
+                }
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -707,6 +728,7 @@ impl fmt::Debug for RecvIo {
 #[derive(Debug)]
 pub(crate) struct State {
     sender: Pin<Box<dyn UdpSender>>,
+    sender_factory: Option<Arc<dyn UdpSenderFactory>>,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
@@ -729,6 +751,50 @@ pub(crate) struct Shared {
 }
 
 impl State {
+    fn finish_accept(
+        &mut self,
+        handle: ConnectionHandle,
+        conn: proto::Connection,
+        create_sender: impl FnOnce() -> Pin<Box<dyn UdpSender>>,
+    ) -> Connecting {
+        self.stats.accepted_handshakes += 1;
+        let sender = create_sender();
+        let runtime = self.runtime.clone();
+        self.recv_state
+            .connections
+            .insert(handle, conn, sender, self.driver_lost, runtime)
+    }
+
+    fn connect(
+        &mut self,
+        now: Instant,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+        create_sender: impl FnOnce() -> Pin<Box<dyn UdpSender>>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Connecting, ConnectError> {
+        if self.driver_lost || self.recv_state.connections.close.is_some() {
+            return Err(ConnectError::EndpointStopping);
+        }
+        if addr.is_ipv6() && !self.ipv6 {
+            return Err(ConnectError::InvalidRemoteAddress(addr));
+        }
+        let addr = if self.ipv6 {
+            SocketAddr::V6(ensure_ipv6(addr))
+        } else {
+            addr
+        };
+
+        let (ch, conn) = self.inner.connect(now, config, addr, server_name)?;
+
+        self.stats.outgoing_handshakes += 1;
+        Ok(self
+            .recv_state
+            .connections
+            .insert(ch, conn, create_sender(), false, runtime))
+    }
+
     fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
         for _ in 0..IO_LOOP_BOUND {
             let (ch, event) = match self.events.poll_recv(cx) {
@@ -934,6 +1000,7 @@ impl EndpointRef {
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
         let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        let sender_factory = socket.sender_factory();
         let sender = socket.create_sender();
         let recv_io = RecvIo::new(socket, &inner);
         Self(Arc::new(EndpointInner {
@@ -945,6 +1012,7 @@ impl EndpointRef {
             recv_io: Mutex::new(recv_io),
             state: Mutex::new(State {
                 sender,
+                sender_factory,
                 inner,
                 ipv6,
                 events,
