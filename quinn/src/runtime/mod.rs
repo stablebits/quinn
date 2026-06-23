@@ -280,7 +280,7 @@ pub fn default_runtime() -> Option<Arc<dyn Runtime>> {
 #[cfg(feature = "runtime-tokio")]
 mod tokio;
 #[cfg(feature = "runtime-tokio")]
-pub use tokio::TokioRuntime;
+pub use tokio::{TokioRuntime, TokioRuntimeHandle};
 
 #[cfg(feature = "runtime-smol")]
 mod smol;

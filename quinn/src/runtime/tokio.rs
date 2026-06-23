@@ -9,6 +9,7 @@ use std::{
 
 use tokio::{
     io::Interest,
+    runtime::{Handle, TryCurrentError},
     time::{Sleep, sleep_until},
 };
 
@@ -35,6 +36,51 @@ impl Runtime for TokioRuntime {
     }
 
     fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
+/// A Quinn runtime backed by a specific Tokio runtime handle.
+///
+/// Unlike [`TokioRuntime`], this does not rely on the current Tokio runtime context. This is useful
+/// when different parts of an endpoint should be scheduled on different Tokio runtimes.
+#[derive(Clone, Debug)]
+pub struct TokioRuntimeHandle {
+    handle: Handle,
+}
+
+impl TokioRuntimeHandle {
+    /// Construct a Quinn runtime from a Tokio runtime handle.
+    pub fn new(handle: Handle) -> Self {
+        Self { handle }
+    }
+
+    /// Construct a Quinn runtime from the current Tokio runtime handle.
+    pub fn current() -> Result<Self, TryCurrentError> {
+        Handle::try_current().map(Self::new)
+    }
+}
+
+impl Runtime for TokioRuntimeHandle {
+    fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
+        let _guard = self.handle.enter();
+        Box::pin(sleep_until(t.into()))
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        self.handle.spawn(future);
+    }
+
+    fn wrap_udp_socket(&self, sock: std::net::UdpSocket) -> io::Result<Box<dyn AsyncUdpSocket>> {
+        let _guard = self.handle.enter();
+        Ok(Box::new(UdpSocket {
+            inner: Arc::new(udp::UdpSocketState::new((&sock).into())?),
+            io: Arc::new(tokio::net::UdpSocket::from_std(sock)?),
+        }))
+    }
+
+    fn now(&self) -> Instant {
+        let _guard = self.handle.enter();
         tokio::time::Instant::now().into_std()
     }
 }

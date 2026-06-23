@@ -19,7 +19,9 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime as _, TokioRuntime, UdpSender};
+use crate::runtime::{
+    AsyncTimer, AsyncUdpSocket, Runtime as _, TokioRuntime, TokioRuntimeHandle, UdpSender,
+};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -43,7 +45,10 @@ use tracing::{error_span, info};
 use tracing_subscriber::EnvFilter;
 use udp::RecvMeta;
 
-use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
+use super::{
+    ClientConfig, Endpoint, EndpointConfig, EndpointRuntimeConfig, RecvStream, SendStream,
+    TransportConfig,
+};
 
 #[test]
 fn handshake_timeout() {
@@ -1468,6 +1473,85 @@ async fn remote_address_monitoring() {
 
     server_task.await.unwrap();
     client_conn.close(0u32.into(), b"done");
+}
+
+#[test]
+fn split_runtime_connect_and_rebind() {
+    let _guard = subscribe();
+
+    let io_runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let connection_runtime = Builder::new_current_thread().enable_time().build().unwrap();
+    let runtimes = EndpointRuntimeConfig::new(
+        Arc::new(TokioRuntimeHandle::new(io_runtime.handle().clone())),
+        Arc::new(TokioRuntimeHandle::new(connection_runtime.handle().clone())),
+    );
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let cert = CertificateDer::from(cert.cert);
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+
+    let server_config =
+        crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+    let server = Endpoint::new_with_runtimes(
+        EndpointConfig::default(),
+        Some(server_config),
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+        runtimes.clone(),
+    )
+    .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = Endpoint::new_with_runtimes(
+        EndpointConfig::default(),
+        None,
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+        runtimes,
+    )
+    .unwrap();
+    client
+        .set_default_client_config(ClientConfig::with_root_certificates(Arc::new(roots)).unwrap());
+
+    const MSG: &[u8; 5] = b"hello";
+    connection_runtime.block_on(async move {
+        timeout(Duration::from_secs(5), async move {
+            let (accepted_send, accepted_recv) = tokio::sync::oneshot::channel();
+            let (write_send, write_recv) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let connection = server.accept().await.unwrap().await.unwrap();
+                accepted_send.send(()).unwrap();
+                write_recv.await.unwrap();
+                let mut stream = connection.open_uni().await.unwrap();
+                stream.write_all(MSG).await.unwrap();
+                stream.finish().unwrap();
+                _ = stream.stopped().await;
+            });
+
+            let connection = client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            accepted_recv.await.unwrap();
+            client
+                .rebind(
+                    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+                )
+                .unwrap();
+            write_send.send(()).unwrap();
+            let mut stream = connection.accept_uni().await.unwrap();
+            assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    });
 }
 
 #[tokio::test]

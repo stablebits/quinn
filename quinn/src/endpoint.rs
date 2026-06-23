@@ -56,7 +56,41 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub(crate) inner: EndpointRef,
+    endpoint_driver_runtime: Arc<dyn Runtime>,
     runtime: Arc<dyn Runtime>,
+}
+
+/// Runtime configuration for an [`Endpoint`].
+///
+/// Quinn uses an endpoint driver to receive UDP datagrams and route them to connections, and
+/// per-connection drivers for protocol timers, transmission, and application-facing state. Most
+/// applications should use [`EndpointRuntimeConfig::single`], but latency-sensitive applications can
+/// use [`EndpointRuntimeConfig::new`] to schedule the endpoint driver on a separate runtime.
+#[derive(Debug, Clone)]
+pub struct EndpointRuntimeConfig {
+    endpoint_driver: Arc<dyn Runtime>,
+    connection: Arc<dyn Runtime>,
+}
+
+impl EndpointRuntimeConfig {
+    /// Use `runtime` for both endpoint and connection drivers.
+    pub fn single(runtime: Arc<dyn Runtime>) -> Self {
+        Self {
+            endpoint_driver: runtime.clone(),
+            connection: runtime,
+        }
+    }
+
+    /// Use separate runtimes for the endpoint driver and connection drivers.
+    ///
+    /// `endpoint_driver` is used to wrap the UDP socket and schedule the endpoint driver. `connection`
+    /// is used to schedule per-connection drivers and timers.
+    pub fn new(endpoint_driver: Arc<dyn Runtime>, connection: Arc<dyn Runtime>) -> Self {
+        Self {
+            endpoint_driver,
+            connection,
+        }
+    }
 }
 
 impl Endpoint {
@@ -150,8 +184,24 @@ impl Endpoint {
         socket: std::net::UdpSocket,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
-        let socket = runtime.wrap_udp_socket(socket)?;
-        Self::new_with_abstract_socket(config, server_config, socket, runtime)
+        Self::new_with_runtimes(
+            config,
+            server_config,
+            socket,
+            EndpointRuntimeConfig::single(runtime),
+        )
+    }
+
+    /// Construct an endpoint with arbitrary configuration, socket, and runtime configuration
+    #[cfg(not(wasm_browser))]
+    pub fn new_with_runtimes(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: std::net::UdpSocket,
+        runtimes: EndpointRuntimeConfig,
+    ) -> io::Result<Self> {
+        let socket = runtimes.endpoint_driver.wrap_udp_socket(socket)?;
+        Self::new_with_abstract_socket_and_runtimes(config, server_config, socket, runtimes)
     }
 
     /// Construct an endpoint with arbitrary configuration and pre-constructed abstract socket
@@ -164,16 +214,36 @@ impl Endpoint {
         socket: Box<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
+        Self::new_with_abstract_socket_and_runtimes(
+            config,
+            server_config,
+            socket,
+            EndpointRuntimeConfig::single(runtime),
+        )
+    }
+
+    /// Construct an endpoint with arbitrary configuration, a pre-constructed abstract socket, and
+    /// runtime configuration.
+    ///
+    /// Useful when `socket` has additional state (e.g. sidechannels) attached for which shared
+    /// ownership is needed, and when the endpoint driver should be scheduled separately from
+    /// connection drivers.
+    pub fn new_with_abstract_socket_and_runtimes(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: Box<dyn AsyncUdpSocket>,
+        runtimes: EndpointRuntimeConfig,
+    ) -> io::Result<Self> {
         let addr = socket.local_addr()?;
         let allow_mtud = !socket.may_fragment();
         let rc = EndpointRef::new(
             socket,
             proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new), allow_mtud),
             addr.is_ipv6(),
-            runtime.clone(),
+            runtimes.connection.clone(),
         );
         let driver = EndpointDriver(rc.clone());
-        runtime.spawn(Box::pin(
+        runtimes.endpoint_driver.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
                     tracing::error!("I/O error: {}", e);
@@ -181,7 +251,11 @@ impl Endpoint {
             }
             .instrument(Span::current()),
         ));
-        Ok(Self { inner: rc, runtime })
+        Ok(Self {
+            inner: rc,
+            endpoint_driver_runtime: runtimes.endpoint_driver,
+            runtime: runtimes.connection,
+        })
     }
 
     /// Get the next incoming connection attempt from a client
@@ -267,7 +341,7 @@ impl Endpoint {
     /// See [`Endpoint::rebind_abstract()`] for details.
     #[cfg(not(wasm_browser))]
     pub fn rebind(&self, socket: std::net::UdpSocket) -> io::Result<()> {
-        self.rebind_abstract(self.runtime.wrap_udp_socket(socket)?)
+        self.rebind_abstract(self.endpoint_driver_runtime.wrap_udp_socket(socket)?)
     }
 
     /// Switch to a new UDP socket
