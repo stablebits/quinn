@@ -468,6 +468,24 @@ impl Connection {
         }
     }
 
+    /// Receive one or more application datagrams
+    ///
+    /// Fills `datagrams` with as many already-received datagrams as are available, up to the length
+    /// of `datagrams`. If none are buffered, waits for at least one datagram to arrive or for the
+    /// connection to close.
+    ///
+    /// Returns the number of entries written. If `datagrams` is empty, returns `Ok(0)` immediately.
+    /// If the connection is closed and no datagrams remain buffered, returns the connection error.
+    ///
+    /// This operation is cancel-safe.
+    pub fn read_datagrams<'a>(&'a self, datagrams: &'a mut [Bytes]) -> ReadDatagrams<'a> {
+        ReadDatagrams {
+            conn: &self.0,
+            datagrams,
+            notify: self.0.shared.datagram_received.notified(),
+        }
+    }
+
     /// Wait for the connection to be closed for any reason
     ///
     /// Despite the return type's name, closed connections are often not an error condition at the
@@ -1005,6 +1023,54 @@ impl Future for ReadDatagram<'_> {
         if let Some(x) = state.inner.datagrams().recv() {
             return Poll::Ready(Ok(x));
         } else if let Some(e) = &state.error {
+            return Poll::Ready(Err(e.clone()));
+        }
+        loop {
+            match this.notify.as_mut().poll(ctx) {
+                // `state` lock ensures we didn't race with readiness
+                Poll::Pending => return Poll::Pending,
+                // Spurious wakeup, get a new future
+                Poll::Ready(()) => this
+                    .notify
+                    .set(this.conn.shared.datagram_received.notified()),
+            }
+        }
+    }
+}
+
+pin_project! {
+    /// Future produced by [`Connection::read_datagrams`]
+    pub struct ReadDatagrams<'a> {
+        conn: &'a ConnectionRef,
+        datagrams: &'a mut [Bytes],
+        #[pin]
+        notify: Notified<'a>,
+    }
+}
+
+impl Future for ReadDatagrams<'_> {
+    type Output = Result<usize, ConnectionError>;
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let datagrams = &mut **this.datagrams;
+        if datagrams.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut state = this.conn.state.lock("ReadDatagrams::poll");
+        // Check for buffered datagrams before checking `state.error` so that already-received
+        // datagrams, which are necessarily finite, can be drained from a closed connection.
+        let mut count = 0;
+        while count < datagrams.len() {
+            let Some(datagram) = state.inner.datagrams().recv() else {
+                break;
+            };
+            datagrams[count] = datagram;
+            count += 1;
+        }
+        if count != 0 {
+            return Poll::Ready(Ok(count));
+        } else if let Some(ref e) = state.error {
             return Poll::Ready(Err(e.clone()));
         }
         loop {

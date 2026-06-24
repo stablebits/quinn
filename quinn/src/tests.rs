@@ -1625,6 +1625,58 @@ async fn two_datagram_readers() {
 }
 
 #[tokio::test]
+async fn read_datagrams_empty_buffer_returns_immediately() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let _server = server.unwrap();
+
+    let mut datagrams: [Bytes; 0] = [];
+    assert_eq!(client.read_datagrams(&mut datagrams).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn read_datagrams_respects_buffer_capacity_and_drains_after_close() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    let payloads: [&'static [u8]; 3] = [b"one", b"two", b"three"];
+    for payload in payloads {
+        server.send_datagram(Bytes::from_static(payload)).unwrap();
+    }
+
+    let mut datagrams: [Bytes; 2] = std::array::from_fn(|_| Bytes::new());
+    assert_eq!(client.read_datagrams(&mut datagrams).await.unwrap(), 2);
+    assert_eq!(&datagrams[0][..], payloads[0]);
+    assert_eq!(&datagrams[1][..], payloads[1]);
+
+    client.close(0u32.into(), b"done");
+
+    let mut datagrams: [Bytes; 2] = std::array::from_fn(|_| Bytes::new());
+    assert_eq!(client.read_datagrams(&mut datagrams).await.unwrap(), 1);
+    assert_eq!(&datagrams[0][..], payloads[2]);
+
+    let error = client.read_datagrams(&mut datagrams).await.unwrap_err();
+    assert!(matches!(error, crate::ConnectionError::LocallyClosed));
+}
+
+#[tokio::test]
 async fn multiple_conns_with_zero_length_cids() {
     let _guard = subscribe();
     let mut factory = EndpointFactory::new();
