@@ -242,7 +242,10 @@ impl Endpoint {
             addr.is_ipv6(),
             runtimes.connection.clone(),
         );
-        let driver = EndpointDriver(rc.clone());
+        let driver = EndpointDriver {
+            endpoint: rc.clone(),
+            runtime: runtimes.connection.clone(),
+        };
         runtimes.endpoint_driver.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -364,24 +367,27 @@ impl Endpoint {
     pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
         let addr = socket.local_addr()?;
         let sender_factory = socket.sender_factory();
-        let mut recv_io = self.inner.recv_io.lock().unwrap();
-        let mut inner = self.inner.state.lock().unwrap();
-        recv_io.prev_socket = Some(mem::replace(&mut recv_io.socket, socket));
-        inner.sender = recv_io.socket.create_sender();
-        inner.sender_factory = sender_factory;
-        inner.ipv6 = addr.is_ipv6();
+        let driver = {
+            let mut recv_io = self.inner.recv_io.lock().unwrap();
+            let mut inner = self.inner.state.lock().unwrap();
+            recv_io.prev_socket = Some(mem::replace(&mut recv_io.socket, socket));
+            inner.sender = recv_io.socket.create_sender();
+            inner.sender_factory = sender_factory;
+            inner.ipv6 = addr.is_ipv6();
 
-        // Update connection socket references
-        for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let new_sender = match &inner.sender_factory {
-                Some(sender_factory) => sender_factory.create_sender(),
-                None => recv_io.socket.create_sender(),
-            };
-            let _ = sender.send(ConnectionEvent::Rebind(new_sender));
-        }
-        if let Some(driver) = inner.driver.take() {
-            // Ensure the driver can register for wake-ups from the new socket
+            // Update connection socket references
+            for sender in inner.recv_state.connections.senders.values() {
+                // Ignoring errors from dropped connections
+                let new_sender = match &inner.sender_factory {
+                    Some(sender_factory) => sender_factory.create_sender(),
+                    None => recv_io.socket.create_sender(),
+                };
+                let _ = sender.send(ConnectionEvent::Rebind(new_sender));
+            }
+            inner.wake_driver()
+        };
+        if let Some(driver) = driver {
+            // Ensure the driver observes the new socket promptly.
             driver.wake();
         }
 
@@ -480,34 +486,36 @@ pub struct EndpointStats {
 /// an I/O error occurs.
 #[must_use = "endpoint drivers must be spawned for I/O to occur"]
 #[derive(Debug)]
-pub(crate) struct EndpointDriver(pub(crate) EndpointRef);
+pub(crate) struct EndpointDriver {
+    pub(crate) endpoint: EndpointRef,
+    runtime: Arc<dyn Runtime>,
+}
 
 impl Future for EndpointDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let runtime = {
-            let mut endpoint = self.0.state.lock().unwrap();
-            match endpoint.driver.as_mut() {
-                Some(old_waker) => old_waker.clone_from(cx.waker()),
-                None => endpoint.driver = Some(cx.waker().clone()),
-            }
-            endpoint.runtime.clone()
-        };
+        let this = self.get_mut();
 
-        let now = runtime.now();
-        let mut keep_going = self.0.drive_recv(cx, now, &*runtime)?;
+        let now = this.runtime.now();
+        let mut keep_going = this.endpoint.drive_recv(cx, now, &*this.runtime)?;
 
-        let mut endpoint = self.0.state.lock().unwrap();
-        keep_going |= endpoint.handle_events(cx, &self.0.shared);
+        let mut endpoint = this.endpoint.state.lock().unwrap();
+        keep_going |= endpoint.driver_woken;
+        endpoint.driver_woken = false;
+        keep_going |= endpoint.handle_events(cx, &this.endpoint.shared);
 
         if !endpoint.recv_state.incoming.is_empty() {
-            self.0.shared.incoming.notify_waiters();
+            this.endpoint.shared.incoming.notify_waiters();
         }
 
-        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
+        if this.endpoint.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
             Poll::Ready(Ok(()))
         } else {
+            match &mut endpoint.driver {
+                Some(driver) => driver.clone_from(cx.waker()),
+                None => endpoint.driver = Some(cx.waker().clone()),
+            }
             drop(endpoint);
             // If there is more work to do schedule the endpoint task again.
             // `wake_by_ref()` is called outside the lock to minimize
@@ -522,9 +530,9 @@ impl Future for EndpointDriver {
 
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
-        let mut endpoint = self.0.state.lock().unwrap();
+        let mut endpoint = self.endpoint.state.lock().unwrap();
         endpoint.driver_lost = true;
-        self.0.shared.incoming.notify_waiters();
+        self.endpoint.shared.incoming.notify_waiters();
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
         endpoint.recv_state.connections.senders.clear();
@@ -732,6 +740,8 @@ pub(crate) struct State {
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
+    /// Set when the driver is woken while no driver waker is stored.
+    driver_woken: bool,
     ipv6: bool,
     events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
     driver_lost: bool,
@@ -793,6 +803,15 @@ impl State {
             .recv_state
             .connections
             .insert(ch, conn, create_sender(), false, runtime))
+    }
+
+    fn wake_driver(&mut self) -> Option<Waker> {
+        if let Some(driver) = self.driver.take() {
+            Some(driver)
+        } else {
+            self.driver_woken = true;
+            None
+        }
     }
 
     fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
@@ -1017,6 +1036,7 @@ impl EndpointRef {
                 ipv6,
                 events,
                 driver: None,
+                driver_woken: false,
                 driver_lost: false,
                 recv_state,
                 runtime,
@@ -1041,10 +1061,10 @@ impl Drop for EndpointRef {
             return;
         }
 
-        let endpoint = &mut *self.0.state.lock().unwrap();
         // If the driver is about to be on its own, ensure it can shut down if the last
         // connection is gone.
-        if let Some(task) = endpoint.driver.take() {
+        let task = self.0.state.lock().unwrap().wake_driver();
+        if let Some(task) = task {
             task.wake();
         }
     }
