@@ -43,6 +43,7 @@ use std::pin::Pin;
 
 mod connection;
 mod endpoint;
+mod event_channel;
 mod incoming;
 mod mutex;
 mod recv_stream;

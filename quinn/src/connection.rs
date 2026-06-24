@@ -19,12 +19,12 @@ use thiserror::Error;
 use tokio::sync::{
     Notify,
     futures::{Notified, OwnedNotified},
-    mpsc, oneshot, watch,
+    oneshot, watch,
 };
 use tracing::{Instrument, Span, debug_span};
 
 use crate::{
-    ConnectionEvent, Duration, Instant, VarInt,
+    ConnectionEvent, Duration, Instant, VarInt, event_channel,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, Runtime, UdpSender},
@@ -48,8 +48,8 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        endpoint_events: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
+        conn_events: event_channel::Receiver<ConnectionEvent>,
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
@@ -1162,8 +1162,8 @@ pub(crate) struct State {
     handshake_confirmed: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    conn_events: event_channel::Receiver<ConnectionEvent>,
+    endpoint_events: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
@@ -1177,8 +1177,8 @@ impl State {
     fn new(
         inner: proto::Connection,
         handle: ConnectionHandle,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        endpoint_events: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
+        conn_events: event_channel::Receiver<ConnectionEvent>,
         on_handshake_data: oneshot::Sender<()>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {

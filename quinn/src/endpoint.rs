@@ -38,13 +38,13 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{Notify, futures::Notified, mpsc};
+use tokio::sync::{Notify, futures::Notified};
 use tracing::{Instrument, Span};
 use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
-    connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
+    connection::Connecting, event_channel, incoming::Incoming, work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -756,7 +756,7 @@ pub(crate) struct State {
     /// Set when the driver is woken while no driver waker is stored.
     driver_woken: bool,
     ipv6: bool,
-    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
+    events: event_channel::Receiver<(ConnectionHandle, EndpointEvent)>,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
@@ -934,9 +934,9 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 #[derive(Debug)]
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    senders: FxHashMap<ConnectionHandle, event_channel::Sender<ConnectionEvent>>,
     /// Stored to give out clones to new ConnectionInners
-    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    sender: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
 }
@@ -950,7 +950,7 @@ impl ConnectionSet {
         driver_lost: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        let (send, recv) = event_channel::channel();
         if let Some((error_code, reason)) = &self.close {
             send.send(ConnectionEvent::Close {
                 error_code: *error_code,
@@ -1030,7 +1030,7 @@ impl EndpointRef {
         ipv6: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
-        let (sender, events) = mpsc::unbounded_channel();
+        let (sender, events) = event_channel::channel();
         let recv_state = RecvState::new(sender);
         let sender_factory = socket.sender_factory();
         let sender = socket.create_sender();
@@ -1102,7 +1102,7 @@ struct ReceivedDatagramBuffer {
 }
 
 impl RecvState {
-    fn new(sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>) -> Self {
+    fn new(sender: event_channel::Sender<(ConnectionHandle, EndpointEvent)>) -> Self {
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
