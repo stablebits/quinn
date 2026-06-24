@@ -657,10 +657,20 @@ impl EndpointInner {
             let poll_res = {
                 let RecvIo {
                     recv_buf,
+                    datagrams,
                     recv_limiter,
                     ..
                 } = &mut *recv_io;
-                poll_socket(self, cx, &mut *socket, recv_buf, recv_limiter, runtime, now)
+                poll_socket(
+                    self,
+                    cx,
+                    &mut *socket,
+                    recv_buf,
+                    datagrams,
+                    recv_limiter,
+                    runtime,
+                    now,
+                )
             };
             if poll_res.is_ok() {
                 recv_io.prev_socket = Some(socket);
@@ -671,6 +681,7 @@ impl EndpointInner {
             let RecvIo {
                 socket,
                 recv_buf,
+                datagrams,
                 recv_limiter,
                 ..
             } = &mut *recv_io;
@@ -679,6 +690,7 @@ impl EndpointInner {
                 cx,
                 &mut **socket,
                 recv_buf,
+                datagrams,
                 recv_limiter,
                 runtime,
                 now,
@@ -702,21 +714,22 @@ struct RecvIo {
     /// until the first packet arrives on the new socket.
     prev_socket: Option<Box<dyn AsyncUdpSocket>>,
     recv_buf: Box<[u8]>,
+    /// Reused buffer that received datagrams are copied into and split into owned slices.
+    datagrams: BytesMut,
     recv_limiter: WorkLimiter,
 }
 
 impl RecvIo {
     fn new(socket: Box<dyn AsyncUdpSocket>, endpoint: &proto::Endpoint) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * socket.max_receive_segments()
-                * BATCH_SIZE
-        ];
+        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
+            as usize
+            * socket.max_receive_segments();
+        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
         Self {
             socket,
             prev_socket: None,
             recv_buf: recv_buf.into(),
+            datagrams: BytesMut::with_capacity(datagram_capacity),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -1018,7 +1031,7 @@ impl EndpointRef {
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
-        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        let recv_state = RecvState::new(sender);
         let sender_factory = socket.sender_factory();
         let sender = socket.create_sender();
         let recv_io = RecvIo::new(socket, &inner);
@@ -1081,19 +1094,15 @@ impl std::ops::Deref for EndpointRef {
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
-    /// Reused buffer that received datagrams are copied into and split into owned slices.
-    datagrams: BytesMut,
+}
+
+struct ReceivedDatagramBuffer {
+    meta: RecvMeta,
+    data: BytesMut,
 }
 
 impl RecvState {
-    fn new(
-        sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        max_receive_segments: usize,
-        endpoint: &proto::Endpoint,
-    ) -> Self {
-        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
-            as usize
-            * max_receive_segments;
+    fn new(sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>) -> Self {
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -1101,7 +1110,6 @@ impl RecvState {
                 close: None,
             },
             incoming: VecDeque::new(),
-            datagrams: BytesMut::with_capacity(datagram_capacity),
         }
     }
 
@@ -1109,27 +1117,11 @@ impl RecvState {
         &mut self,
         endpoint: &mut proto::Endpoint,
         sender: &mut Pin<Box<dyn UdpSender>>,
-        metas: &[RecvMeta],
-        iovs: &[IoSliceMut<'_>],
-        msgs: usize,
+        received: Vec<ReceivedDatagramBuffer>,
         now: Instant,
     ) -> bool {
         let mut received_connection_packet = false;
-        // Copy the received batch into `datagrams` and split each datagram off as
-        // an owned slice. We can't read directly into `datagrams` and drop
-        // `recv_buf`: once a slice has been handed to a connection the allocation
-        // is shared, so the next `reserve` must allocate fresh backing memory.
-        // Reading in place would therefore mean reserving the worst-case iovec
-        // envelope before every poll and reallocating it whenever a prior datagram
-        // is still in flight. `recv_buf` stays an allocate-once scratch buffer, and
-        // we reserve only the bytes actually received.
-        let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
-        self.datagrams.reserve(batch_len);
-        for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-            self.datagrams.extend_from_slice(&buf[..meta.len]);
-        }
-        for meta in metas.iter().take(msgs) {
-            let mut data = self.datagrams.split_to(meta.len);
+        for ReceivedDatagramBuffer { meta, mut data } in received {
             while !data.is_empty() {
                 let buf = data.split_to(meta.stride.min(data.len()));
                 let mut response_buffer = Vec::new();
@@ -1176,6 +1168,7 @@ fn poll_socket(
     cx: &mut Context<'_>,
     socket: &mut dyn AsyncUdpSocket,
     recv_buf: &mut [u8],
+    datagrams: &mut BytesMut,
     recv_limiter: &mut WorkLimiter,
     runtime: &dyn Runtime,
     now: Instant,
@@ -1196,6 +1189,22 @@ fn poll_socket(
         match socket.poll_recv(cx, &mut iovs, &mut metas) {
             Poll::Ready(Ok(msgs)) => {
                 recv_limiter.record_work(msgs);
+                // Copy before acquiring endpoint state. A single backing buffer avoids one
+                // allocation per datagram while still yielding independently owned slices.
+                let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
+                datagrams.reserve(batch_len);
+                for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
+                    datagrams.extend_from_slice(&buf[..meta.len]);
+                }
+                let received = metas
+                    .iter()
+                    .copied()
+                    .take(msgs)
+                    .map(|meta| ReceivedDatagramBuffer {
+                        meta,
+                        data: datagrams.split_to(meta.len),
+                    })
+                    .collect();
                 let received_connection_packet = {
                     let mut state = endpoint.state.lock().unwrap();
                     let State {
@@ -1204,7 +1213,7 @@ fn poll_socket(
                         sender,
                         ..
                     } = &mut *state;
-                    recv_state.handle_recv_batch(inner, sender, &metas, &iovs, msgs, now)
+                    recv_state.handle_recv_batch(inner, sender, received, now)
                 };
                 progress.received_connection_packet |= received_connection_packet;
             }
