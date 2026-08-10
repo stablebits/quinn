@@ -1,6 +1,13 @@
 #[cfg(feature = "qlog")]
 use std::{fs::File, io::BufWriter, path::PathBuf};
-use std::{io, net::SocketAddr, num::ParseIntError, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    num::{NonZeroUsize, ParseIntError},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -26,6 +33,11 @@ pub mod server;
 // Common options between client and server binary
 #[derive(Parser)]
 pub struct CommonOpt {
+    /// Number of Tokio worker threads
+    ///
+    /// By default, Tokio uses the number of available CPU cores.
+    #[clap(long)]
+    pub workers: Option<NonZeroUsize>,
     /// Send buffer size in bytes
     ///
     /// This can use SI suffixes for sizes. For example, 1M will request

@@ -26,6 +26,12 @@ pub struct Opt {
     common: CommonOpt,
 }
 
+impl Opt {
+    pub fn workers(&self) -> Option<usize> {
+        self.common.workers.map(|workers| workers.get())
+    }
+}
+
 pub async fn run(opt: Opt) -> Result<()> {
     let (key, cert) = match (&opt.key, &opt.cert) {
         (Some(key), Some(cert)) => (

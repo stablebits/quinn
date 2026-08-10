@@ -68,6 +68,12 @@ pub struct Opt {
     common: CommonOpt,
 }
 
+impl Opt {
+    pub fn workers(&self) -> Option<usize> {
+        self.common.workers.map(|workers| workers.get())
+    }
+}
+
 pub async fn run(opt: Opt) -> Result<()> {
     let mut host_parts = opt.host.split(':');
     let host_name = host_parts.next().unwrap();
