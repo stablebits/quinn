@@ -540,7 +540,7 @@ impl Drop for EndpointDriver {
         // `idle` only re-reads that after being notified, and with the driver gone nothing else
         // can wake it. Same reason as the equivalent check in `EndpointInner::accept`.
         if endpoint.is_idle() {
-            self.0.shared.idle.notify_waiters();
+            self.endpoint.shared.idle.notify_waiters();
         }
     }
 }
@@ -601,7 +601,9 @@ impl EndpointInner {
                 if let Some(sender_factory) = state.sender_factory.clone() {
                     Ok(state.finish_accept(handle, conn, || sender_factory.create_sender()))
                 } else {
-                    let recv_io = recv_io.as_ref().expect("socket locked without a sender factory");
+                    let recv_io = recv_io
+                        .as_ref()
+                        .expect("socket locked without a sender factory");
                     Ok(state.finish_accept(handle, conn, || recv_io.socket.create_sender()))
                 }
             }

@@ -30,6 +30,11 @@ pub mod noprotection;
 pub mod client;
 pub mod server;
 
+#[cfg(feature = "split-runtimes")]
+pub type RuntimeConfig = quinn::EndpointRuntimeConfig;
+#[cfg(not(feature = "split-runtimes"))]
+pub type RuntimeConfig = Arc<dyn quinn::Runtime>;
+
 // Common options between client and server binary
 #[derive(Parser)]
 pub struct CommonOpt {
@@ -38,6 +43,12 @@ pub struct CommonOpt {
     /// By default, Tokio uses the number of available CPU cores.
     #[clap(long)]
     pub workers: Option<NonZeroUsize>,
+    /// Number of Tokio worker threads used by the endpoint driver
+    ///
+    /// By default, Tokio uses the number of available CPU cores.
+    #[cfg(feature = "split-runtimes")]
+    #[clap(long)]
+    pub endpoint_workers: Option<NonZeroUsize>,
     /// Send buffer size in bytes
     ///
     /// This can use SI suffixes for sizes. For example, 1M will request

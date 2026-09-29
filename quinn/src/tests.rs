@@ -45,7 +45,7 @@ use tracing::{error_span, info};
 use tracing_subscriber::EnvFilter;
 use udp::RecvMeta;
 
-use super::{
+use crate::{
     ClientConfig, Endpoint, EndpointConfig, EndpointRuntimeConfig, RecvStream, SendStream,
     TransportConfig,
 };

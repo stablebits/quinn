@@ -3,11 +3,11 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quinn::{crypto::rustls::QuicServerConfig, TokioRuntime};
+use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::{debug, error, info};
 
-use crate::{noprotection::NoProtectionServerConfig, CommonOpt, PERF_CIPHER_SUITES};
+use crate::{noprotection::NoProtectionServerConfig, CommonOpt, RuntimeConfig, PERF_CIPHER_SUITES};
 
 #[derive(Parser)]
 #[clap(name = "server")]
@@ -30,9 +30,14 @@ impl Opt {
     pub fn workers(&self) -> Option<usize> {
         self.common.workers.map(|workers| workers.get())
     }
+
+    #[cfg(feature = "split-runtimes")]
+    pub fn endpoint_workers(&self) -> Option<usize> {
+        self.common.endpoint_workers.map(|workers| workers.get())
+    }
 }
 
-pub async fn run(opt: Opt) -> Result<()> {
+pub async fn run(opt: Opt, runtimes: RuntimeConfig) -> Result<()> {
     let (key, cert) = match (&opt.key, &opt.cert) {
         (Some(key), Some(cert)) => (
             PrivateKeyDer::from_pem_file(key).context("reading private key")?,
@@ -85,7 +90,11 @@ pub async fn run(opt: Opt) -> Result<()> {
     let mut endpoint_cfg = quinn::EndpointConfig::default();
     endpoint_cfg.max_udp_payload_size(opt.common.max_udp_payload_size)?;
 
-    let endpoint = quinn::Endpoint::new(endpoint_cfg, Some(config), socket, Arc::new(TokioRuntime))
+    #[cfg(not(feature = "split-runtimes"))]
+    let endpoint = quinn::Endpoint::new(endpoint_cfg, Some(config), socket, runtimes)
+        .context("creating endpoint")?;
+    #[cfg(feature = "split-runtimes")]
+    let endpoint = quinn::Endpoint::new_with_runtimes(endpoint_cfg, Some(config), socket, runtimes)
         .context("creating endpoint")?;
 
     info!("listening on {}", endpoint.local_addr().unwrap());
