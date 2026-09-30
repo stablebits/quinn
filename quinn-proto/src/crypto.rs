@@ -191,6 +191,20 @@ pub struct ExportKeyingMaterialError;
 pub trait HandshakeTokenKey: Send + Sync {
     /// Derive AEAD using hkdf
     fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey>;
+
+    /// Derive a dedicated key for authenticating handshake tokens
+    ///
+    /// Called once when installing this key in a server configuration, not once per token.
+    /// The key must produce 32-byte tags and be independent of keys returned by
+    /// [`Self::aead_from_hkdf`]. Returning `Some` enables MAC-only Retry tokens and an outer MAC
+    /// on encrypted NEW_TOKENs. Encrypted NEW_TOKENs must fit in 990 bytes, including their nonce.
+    /// Returning `None` retains the legacy encrypted token format and its per-token AEAD work.
+    ///
+    /// Servers sharing tokens must use the same key and format. Changing formats invalidates
+    /// outstanding tokens, just like changing the key.
+    fn token_authentication_key(&self) -> Option<Box<dyn HmacKey>> {
+        None
+    }
 }
 
 /// A key for sealing data with AEAD-based algorithms

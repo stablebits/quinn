@@ -90,3 +90,25 @@ The expected output should be something like:
 
 Notice how the server sees multiple incoming connections with different IDs coming from the same
 endpoint.
+
+
+## Handshake token authentication
+
+The built-in ring and aws-lc providers use a cached HMAC-SHA256 key. Retry tokens
+are authenticated without encryption and bind the observed IP/port, original and
+Retry connection IDs, and issuance time. The Retry packet's integrity tag is
+unchanged. Retry tokens remain reusable within their configured lifetime
+(default 15 seconds).
+
+NEW_TOKEN payloads remain encrypted and retain their replay checks. An outer MAC
+bound to the client's IP (not port) rejects forged tokens before decryption or
+replay-log access. Failed authentication leaves the address unvalidated; the
+application can choose manual Retry or ignore as usual. A MAC-valid Retry token
+with an expired timestamp or mismatched destination CID produces INVALID_TOKEN.
+
+This changes the server's opaque token format. Old tokens become unvalidated
+without trying legacy decryption. In-flight Retry attempts may need to restart,
+and cached NEW_TOKENs may require a fresh Retry. Servers sharing tokens must use
+matching keys and formats. Custom HandshakeTokenKey implementations retain the
+legacy format unless they implement token_authentication_key. This optimization
+does not add an Initial filter, admission budget, or runtime isolation.
