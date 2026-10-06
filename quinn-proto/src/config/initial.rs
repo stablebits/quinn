@@ -32,7 +32,11 @@ pub trait InitialFilter: Send + Sync {
 pub enum InitialDecision {
     /// Continue normal processing and create an Incoming if the packet is valid.
     Proceed,
-    /// Send Retry without deriving Initial keys or allocating incoming state.
+    /// Send Retry without allocating incoming state.
+    ///
+    /// Avoids Initial-key derivation with the built-in provider. Custom providers
+    /// must override [`crate::crypto::ServerConfig::supports_version`] with a cheap
+    /// check to avoid the default key-derivation fallback.
     ///
     /// Becomes Proceed when `InitialContext::may_retry()` is false. Repeated
     /// Initials can each elicit a Retry; clients process at most one per attempt.
