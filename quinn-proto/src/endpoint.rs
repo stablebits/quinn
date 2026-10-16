@@ -496,7 +496,25 @@ impl Endpoint {
                             trace!("dropping initial for connection {dst_cid} per filter");
                             return None;
                         }
-                        InitialDecision::Proceed => {}
+                        InitialDecision::Retry if context.may_retry() => {
+                            if !server_config.crypto.supports_version(header.version) {
+                                debug!(
+                                    "ignoring initial packet version {:#x} unsupported by cryptographic layer",
+                                    header.version
+                                );
+                                return None;
+                            }
+                            let server_config = server_config.clone();
+                            return Some(DatagramEvent::Response(self.retry_inner(
+                                &server_config,
+                                header.version,
+                                addresses,
+                                header.dst_cid,
+                                header.src_cid,
+                                buf,
+                            )));
+                        }
+                        InitialDecision::Proceed | InitialDecision::Retry => {}
                     }
                 }
                 filtered_token = Some(token);
@@ -913,7 +931,7 @@ impl Endpoint {
         ))
     }
 
-    /// Encode a Retry packet into `buf`
+    /// Encode a Retry packet into `buf`, shared by manual and filter-driven Retry
     ///
     /// `orig_dst_cid` and `rem_cid` are respectively the destination and source connection IDs the
     /// peer chose for the Initial packet being responded to. Retry packets carry no packet number

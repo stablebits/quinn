@@ -1,4 +1,4 @@
-//! Admission ordering regressions
+//! Admission ordering and fast Retry regressions
 use super::*;
 use crate::{
     crypto::{HandshakeTokenKey, Keys, UnsupportedVersion},
@@ -291,20 +291,34 @@ fn admission_rejects_all_tokens_before_crypto_and_replay_log() {
 }
 
 #[test]
-fn filtered_handshake_proceed() {
-    let policy = Policy::new(InitialDecision::Proceed);
-    let mut config = keyed_server_config();
-    config.initial_filter(policy.clone());
-    let mut pair = Pair::new(Default::default(), config);
-    pair.connect();
-    let seen = policy.seen();
-    assert_eq!(seen.len(), 1, "Proceed must consult the filter once");
-    assert!(
-        !seen[0].remote_address_validated(),
-        "first flight carries no token"
-    );
-    assert!(seen[0].may_retry(), "first flight may be retried");
-    assert_eq!(seen[0].remote_address(), pair.client.addr);
+fn filtered_handshake_proceed_and_retry() {
+    for verdict in [InitialDecision::Proceed, InitialDecision::Retry] {
+        let policy = Policy::new(verdict);
+        let mut config = keyed_server_config();
+        config.initial_filter(policy.clone());
+        let mut pair = Pair::new(Default::default(), config);
+        pair.connect();
+        let seen = policy.seen();
+        assert!(
+            !seen[0].remote_address_validated(),
+            "first flight carries no token"
+        );
+        assert!(seen[0].may_retry(), "first flight may be retried");
+        assert_eq!(seen[0].remote_address(), pair.client.addr);
+        if verdict == InitialDecision::Retry {
+            assert_eq!(seen.len(), 2, "expected first flight and retried attempt");
+            assert!(
+                seen[1].remote_address_validated(),
+                "retried attempt must carry a valid Retry token"
+            );
+            assert!(
+                !seen[1].may_retry(),
+                "RFC 9000 §8.1.2 forbids retrying a peer holding a Retry token"
+            );
+        } else {
+            assert_eq!(seen.len(), 1, "Proceed must consult the filter once");
+        }
+    }
 }
 
 /// An `Ignore` verdict drops the datagram outright: no state is allocated, nothing is sent back,
@@ -375,6 +389,45 @@ fn post_token_ignore_pays_token_cost_only() {
 }
 
 #[test]
+fn fast_retry_provider_fallback_and_replacement() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let mut config = keyed_server_config();
+    let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
+    let reject_versions = false;
+    let counts = instrument(&mut config, reject_versions);
+    config.initial_filter(Policy::new(InitialDecision::Retry));
+    let mut endpoint = server_endpoint(config);
+    for _ in 0..3 {
+        let mut out = Vec::new();
+        let event = endpoint.handle(Instant::now(), addr, None, None, data.clone(), &mut out);
+        assert!(
+            matches!(event, Some(DatagramEvent::Response(_))),
+            "expected a response datagram"
+        );
+        assert!(is_retry(&out), "fast path must answer with a Retry");
+        assert_eq!(endpoint.open_connections(), 0, "fast Retry opened state");
+    }
+    assert_eq!(
+        counts.values(),
+        [3, 3, 3, 0],
+        "default supports_version derives keys once per Retry"
+    );
+
+    let mut replacement = keyed_server_config();
+    replacement.initial_filter(Policy::new(InitialDecision::Retry));
+    let reject_versions = true;
+    let counts = instrument(&mut replacement, reject_versions);
+    endpoint.set_server_config(Some(Arc::new(replacement)));
+    let event = endpoint.handle(Instant::now(), addr, None, None, data, &mut Vec::new());
+    assert!(event.is_none(), "unsupported version must be dropped");
+    assert_eq!(
+        counts.values(),
+        [1, 0, 0, 0],
+        "unsupported provider must never reach retry_tag"
+    );
+}
+
+#[test]
 fn malformed_initial_is_budgeted_and_no_filter_retains_close() {
     let addr = "[::1]:4433".parse().unwrap();
     let mut data = BytesMut::from(hex!("c4 00000001 00 00 00 3f").as_ref());
@@ -428,7 +481,7 @@ fn authenticated_invalid_retry_retains_error_response() {
     let validation = false;
     let token = issue_token(&config, "[::1]:4434".parse().unwrap(), validation);
     let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &token);
-    let policy = Policy::new(InitialDecision::Ignore);
+    let policy = Policy::new(InitialDecision::Retry);
     config.initial_filter(policy.clone());
     let mut out = Vec::new();
     let event = server_endpoint(config).handle(Instant::now(), addr, None, None, data, &mut out);
@@ -444,6 +497,57 @@ fn authenticated_invalid_retry_retains_error_response() {
         policy.seen().is_empty(),
         "decide must not run for an invalid Retry token"
     );
+}
+
+/// Cheap-capability provider that panics if the fast path derives Initial keys
+struct NoInitialKeys(Arc<dyn crypto::ServerConfig>);
+
+impl crypto::ServerConfig for NoInitialKeys {
+    fn supports_version(&self, version: u32) -> bool {
+        self.0.supports_version(version)
+    }
+
+    fn initial_keys(&self, _: u32, _: ConnectionId) -> Result<Keys, UnsupportedVersion> {
+        panic!("fast Retry derived Initial keys")
+    }
+
+    fn retry_tag(&self, version: u32, cid: ConnectionId, packet: &[u8]) -> [u8; 16] {
+        self.0.retry_tag(version, cid, packet)
+    }
+
+    fn start_session(self: Arc<Self>, _: u32, _: &TransportParameters) -> Box<dyn crypto::Session> {
+        panic!("fast Retry started TLS")
+    }
+}
+
+#[test]
+fn built_in_fast_retry_skips_initial_keys_and_retains_no_route() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let mut config = keyed_server_config();
+    let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[7; 80]);
+    config.crypto = Arc::new(NoInitialKeys(config.crypto.clone()));
+    config.max_incoming = 1;
+    config.initial_filter(Policy::new(InitialDecision::Retry));
+    let mut endpoint = server_endpoint(config);
+    for _ in 0..3 {
+        let mut out = Vec::new();
+        let event = endpoint.handle(Instant::now(), addr, None, None, data.clone(), &mut out);
+        assert!(
+            matches!(event, Some(DatagramEvent::Response(_))),
+            "expected a response datagram"
+        );
+        assert!(is_retry(&out), "fast path must answer with a Retry");
+        assert_eq!(
+            endpoint.known_connections(),
+            0,
+            "fast Retry created a connection"
+        );
+        assert_eq!(
+            endpoint.known_cids(),
+            0,
+            "fast Retry registered a CID route"
+        );
+    }
 }
 
 #[test]
@@ -538,6 +642,42 @@ fn existing_connection_bypasses_exhausted_admission() {
 }
 
 #[test]
+fn endpoint_version_list_cannot_force_unsupported_retry_crypto() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let unknown_version: u32 = 0x12345678;
+    let mut config = keyed_server_config();
+    let mut data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
+    data[1..5].copy_from_slice(&unknown_version.to_be_bytes());
+    config.initial_filter(Policy::new(InitialDecision::Retry));
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.supported_versions(vec![1, unknown_version]);
+    let mut endpoint = Endpoint::new(Arc::new(endpoint_config), Some(Arc::new(config)), true);
+    let mut out = Vec::new();
+    let event = endpoint.handle(Instant::now(), addr, None, None, data, &mut out);
+    assert!(
+        event.is_none(),
+        "version unsupported by crypto must be dropped"
+    );
+    assert!(
+        out.is_empty(),
+        "version unsupported by crypto drew a response"
+    );
+}
+
+#[test]
+fn default_admission_hook_allows_simple_retry_policy() {
+    struct Retry;
+    impl InitialFilter for Retry {
+        fn decide(&self, _: &InitialContext) -> InitialDecision {
+            InitialDecision::Retry
+        }
+    }
+    let mut config = keyed_server_config();
+    config.initial_filter(Arc::new(Retry));
+    Pair::new(Default::default(), config).connect();
+}
+
+#[test]
 fn global_budget_bounds_new_cids_addresses_and_valid_token_replays() {
     /// Admits a fixed number of initials in total
     struct Budget(AtomicUsize);
@@ -585,4 +725,37 @@ fn global_budget_bounds_new_cids_addresses_and_valid_token_replays() {
         [0, 0, budget, 2],
         "only the {budget} admitted initials may pay token costs"
     );
+}
+
+#[test]
+fn coalesced_initials_generate_one_retry() {
+    let mut config = keyed_server_config();
+    let mut data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
+    data.extend_from_slice(&data.clone());
+    let policy = Policy::new(InitialDecision::Retry);
+    config.initial_filter(policy.clone());
+    let mut out = Vec::new();
+    let event = server_endpoint(config).handle(
+        Instant::now(),
+        "[::1]:4433".parse().unwrap(),
+        None,
+        None,
+        data,
+        &mut out,
+    );
+    assert!(
+        matches!(event, Some(DatagramEvent::Response(_))),
+        "expected a response datagram"
+    );
+    assert_eq!(
+        policy.admitted.load(Ordering::Relaxed),
+        1,
+        "coalesced initials must pass the gate once"
+    );
+    assert_eq!(
+        policy.seen().len(),
+        1,
+        "coalesced initials must be decided once"
+    );
+    assert!(is_retry(&out), "expected a single Retry");
 }
