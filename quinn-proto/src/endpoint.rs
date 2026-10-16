@@ -22,7 +22,10 @@ use crate::{
     Side, Transmit, TransportConfig, TransportError,
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
-    config::{ClientConfig, EndpointConfig, ServerConfig},
+    config::{
+        ClientConfig, EndpointConfig, InitialContext, InitialDecision, InitialMetadata,
+        ServerConfig,
+    },
     connection::{Connection, ConnectionArgs, ConnectionError, SideArgs},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
@@ -460,6 +463,46 @@ impl Endpoint {
             return None;
         }
 
+        let early_validation = self.early_validate_first_packet(header);
+        let mut filtered_token = None;
+        if let Some(filter) = &server_config.initial_filter {
+            let metadata = InitialMetadata {
+                remote: addresses.remote,
+                local_ip: addresses.local_ip,
+                received_at: event.now,
+                datagram_len,
+            };
+            if !filter.allow_initial(&metadata) {
+                trace!("dropping initial for connection {dst_cid} per admission gate");
+                return None;
+            }
+            // Preserve the normal encrypted error response for malformed headers,
+            // but only after admission has allowed its cryptographic work.
+            if early_validation.is_ok() {
+                let token = IncomingToken::from_header(
+                    header.dst_cid,
+                    event.first_decode.initial_token(),
+                    server_config,
+                    addresses.remote,
+                );
+                if let Ok(token) = &token {
+                    let context = InitialContext {
+                        metadata,
+                        validated: token.validated,
+                        may_retry: token.retry_src_cid.is_none(),
+                    };
+                    match filter.decide(&context) {
+                        InitialDecision::Ignore => {
+                            trace!("dropping initial for connection {dst_cid} per filter");
+                            return None;
+                        }
+                        InitialDecision::Proceed => {}
+                    }
+                }
+                filtered_token = Some(token);
+            }
+        }
+
         let crypto = match server_config.crypto.initial_keys(header.version, dst_cid) {
             Ok(keys) => keys,
             Err(UnsupportedVersion) => {
@@ -473,7 +516,7 @@ impl Endpoint {
             }
         };
 
-        if let Err(reason) = self.early_validate_first_packet(header) {
+        if let Err(reason) = early_validation {
             return Some(DatagramEvent::Response(self.initial_close(
                 header.version,
                 addresses,
@@ -503,12 +546,14 @@ impl Endpoint {
 
         let server_config = self.server_config.as_ref().unwrap().clone();
 
-        let token = match IncomingToken::from_header(
-            header.dst_cid,
-            &header.token,
-            &server_config,
-            addresses.remote,
-        ) {
+        let token = match filtered_token.unwrap_or_else(|| {
+            IncomingToken::from_header(
+                header.dst_cid,
+                &header.token,
+                &server_config,
+                addresses.remote,
+            )
+        }) {
             Ok(token) => token,
             Err(InvalidRetryTokenError) => {
                 debug!("rejecting invalid retry token");
@@ -806,7 +851,7 @@ impl Endpoint {
 
     /// Check if we should refuse a connection attempt regardless of the packet's contents
     fn early_validate_first_packet(
-        &mut self,
+        &self,
         header: &ProtectedInitialHeader,
     ) -> Result<(), TransportError> {
         // RFC9000 §7.2 dictates that initial (client-chosen) destination CIDs must be at least 8
