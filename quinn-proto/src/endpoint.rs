@@ -853,6 +853,31 @@ impl Endpoint {
         self.remove_incoming_state(&incoming);
         incoming.improper_drop_warner.dismiss();
 
+        Ok(self.retry_inner(
+            &server_config,
+            incoming.packet.header.version,
+            incoming.addresses,
+            incoming.packet.header.dst_cid,
+            incoming.packet.header.src_cid,
+            buf,
+        ))
+    }
+
+    /// Encode a Retry packet into `buf`
+    ///
+    /// `orig_dst_cid` and `rem_cid` are respectively the destination and source connection IDs the
+    /// peer chose for the Initial packet being responded to. Retry packets carry no packet number
+    /// and are not header protected, so this needs no Initial keys. The caller must have checked
+    /// that the crypto provider supports `version`.
+    fn retry_inner(
+        &mut self,
+        server_config: &ServerConfig,
+        version: u32,
+        addresses: FourTuple,
+        orig_dst_cid: ConnectionId,
+        rem_cid: ConnectionId,
+        buf: &mut Vec<u8>,
+    ) -> Transmit {
         // First Initial
         // The peer will use this as the DCID of its following Initials. Initial DCIDs are
         // looked up separately from Handshake/Data DCIDs, so there is no risk of collision
@@ -862,34 +887,29 @@ impl Endpoint {
         let loc_cid = self.local_cid_generator.generate_cid();
 
         let payload = TokenPayload::Retry {
-            address: incoming.addresses.remote,
-            orig_dst_cid: incoming.packet.header.dst_cid,
+            address: addresses.remote,
+            orig_dst_cid,
             issued: server_config.time_source.now(),
         };
         let token = Token::new(payload, &mut self.rng).encode(&*server_config.token_key);
 
         let header = Header::Retry {
             src_cid: loc_cid,
-            dst_cid: incoming.packet.header.src_cid,
-            version: incoming.packet.header.version,
+            dst_cid: rem_cid,
+            version,
         };
 
-        let encode = header.encode(buf);
+        header.encode(buf);
         buf.put_slice(&token);
-        buf.extend_from_slice(&server_config.crypto.retry_tag(
-            incoming.packet.header.version,
-            incoming.packet.header.dst_cid,
-            buf,
-        ));
-        encode.finish(buf, &*incoming.crypto.header.local, None);
+        buf.extend_from_slice(&server_config.crypto.retry_tag(version, orig_dst_cid, buf));
 
-        Ok(Transmit {
-            destination: incoming.addresses.remote,
+        Transmit {
+            destination: addresses.remote,
             ecn: None,
             size: buf.len(),
             segment_size: None,
-            src_ip: incoming.addresses.local_ip,
-        })
+            src_ip: addresses.local_ip,
+        }
     }
 
     /// Ignore this incoming connection attempt, not sending any packet in response
