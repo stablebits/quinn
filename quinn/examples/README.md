@@ -90,3 +90,56 @@ The expected output should be something like:
 
 Notice how the server sees multiple incoming connections with different IDs coming from the same
 endpoint.
+
+## Initial Filter Example
+
+The `initial_filter.rs` example shows how to rate limit inbound connection attempts with
+`InitialFilter`, which runs before any per-connection state is allocated. Every new Initial first
+passes a global budget. Strangers within their own budget are answered with a Retry to confirm the
+source address, the rest are dropped. Peers bearing a valid token proceed under a separate, larger
+handshake budget.
+
+```text
+$ cargo run --example initial_filter
+```
+
+The expected output should be something like:
+
+```text
+New client connecting to a server retrying 1 new client/s
+[client] connected: 127.0.0.1:36999
+[server] accepted 127.0.0.1:47383
+[server] admitted=1 retried=1 ignored=0
+Familiar client connecting again - no problem
+[client] connected: 127.0.0.1:36999
+[server] accepted 127.0.0.1:47383
+[server] admitted=2 retried=1 ignored=0
+Unfamiliar client connecting
+[client] no response within 500ms: the strangers' budget is used up
+[server] admitted=2 retried=1 ignored=1
+```
+
+The first connection is retried once and then admitted when it comes back bearing the token. The
+familiar client reconnects with the NEW_TOKEN it received, so it is admitted without a Retry. A
+different client arriving immediately after usually exceeds the strangers' budget, is dropped, and
+hears nothing; on a slow run the one-second window may have rolled over, and it connects instead.
+
+`InitialFilter` has two hooks, both executed synchronously in the receive path; they must not block
+or re-enter the endpoint. `allow_initial` runs first, before any token authentication, replay-log
+access or Initial-key derivation, and the example enforces its global budget there. Some admitted
+Initials never reach `decide`: a malformed header, or a Retry token that decrypts but is invalid
+for the packet, draws an encrypted CONNECTION_CLOSE as without a filter, costing Initial-key
+derivation and a response, so only the global budget bounds them. The example also drops malformed
+Initials outright.
+
+`decide` runs after token validation, so an `Ignore` there has already paid the token cost: a key
+derivation and decryption per token, forged or not. The example budgets there per class: peers
+with a valid token get their own budget, so a retried client's return doesn't compete with new
+strangers. Validated peers still need a budget: a Retry token can be presented on any number of
+Initials within its lifetime. Packets for connections the endpoint already knows never reach the
+filter.
+
+When `decide` returns `Retry`, the endpoint answers immediately without creating an `Incoming`.
+Retry packets need no Initial keys, so the built-in rustls provider derives none on this path. A
+custom crypto provider should override `crypto::ServerConfig::supports_version`, whose default
+derives Initial keys to check version support.
