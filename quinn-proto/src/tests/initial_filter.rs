@@ -1,7 +1,7 @@
 //! Admission ordering and fast Retry regressions
 use super::*;
 use crate::{
-    crypto::{HandshakeTokenKey, Keys, UnsupportedVersion},
+    crypto::{CryptoError, HandshakeTokenKey, HmacKey, Keys, UnsupportedVersion},
     token::TokenPayload,
 };
 #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
@@ -199,6 +199,7 @@ fn issue_token(config: &ServerConfig, addr: SocketAddr, validation: bool) -> Vec
         TokenPayload::Retry {
             address: addr,
             orig_dst_cid: ConnectionId::new(&[1; 8]),
+            retry_src_cid: None,
             issued: config.time_source.now(),
         }
     };
@@ -210,6 +211,7 @@ fn retry_token(config: &ServerConfig, addr: SocketAddr, issued: SystemTime) -> V
     let payload = TokenPayload::Retry {
         address: addr,
         orig_dst_cid: ConnectionId::new(&[1; 8]),
+        retry_src_cid: None,
         issued,
     };
     config.token_key.encode(payload, &mut rand::rng())
@@ -796,4 +798,272 @@ fn coalesced_initials_generate_one_retry() {
         "coalesced initials must be decided once"
     );
     assert!(is_retry(&out), "expected a single Retry");
+}
+
+/// Enable authenticated tokens, with a MAC key independent of [`token_key`]
+fn authenticate_tokens(config: &mut ServerConfig) {
+    config.token_authentication_key(Some(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &[7; 32]))));
+}
+
+/// An authenticated Retry token for `addr`, valid on an Initial whose DCID is `dst_cid`
+fn authenticated_retry_token(
+    config: &ServerConfig,
+    addr: SocketAddr,
+    dst_cid: ConnectionId,
+) -> Vec<u8> {
+    config.token_key.encode(
+        TokenPayload::Retry {
+            address: addr,
+            orig_dst_cid: ConnectionId::new(&[9; 8]),
+            retry_src_cid: Some(dst_cid),
+            issued: config.time_source.now(),
+        },
+        &mut rand::rng(),
+    )
+}
+
+/// With authenticated tokens, forged and encrypted-only tokens are rejected before any AEAD work.
+#[test]
+fn authenticated_tokens_reject_forgeries_before_aead() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    let mut config = keyed_server_config();
+    let validation = true;
+    let encrypted_only = issue_token(&config, addr, validation);
+    authenticate_tokens(&mut config);
+    let valid = issue_token(&config, addr, validation);
+    let mut forged_validation = valid.clone();
+    *forged_validation.last_mut().unwrap() ^= 1;
+    let mut forged_retry = authenticated_retry_token(&config, addr, dst_cid);
+    *forged_retry.last_mut().unwrap() ^= 1;
+    let forged: Vec<_> = [encrypted_only, forged_validation, forged_retry, vec![7; 80]]
+        .iter()
+        .map(|token| initial_packet(&config, dst_cid, token))
+        .collect();
+    let valid = initial_packet(&config, dst_cid, &valid);
+    let reject_versions = false;
+    let counts = instrument(&mut config, reject_versions);
+    let policy = Policy::new(InitialDecision::Ignore);
+    config.initial_filter(policy.clone());
+    let mut endpoint = server_endpoint(config);
+    for data in forged {
+        let event = endpoint.handle(Instant::now(), addr, None, None, data, &mut Vec::new());
+        assert!(event.is_none(), "Ignore must not produce an event");
+    }
+    assert_eq!(
+        counts.values(),
+        [0; 4],
+        "forged tokens must be rejected before any AEAD or replay-log work"
+    );
+    assert!(
+        policy
+            .seen()
+            .iter()
+            .all(|ctx| !ctx.remote_address_validated()),
+        "forged tokens must leave the peer unvalidated"
+    );
+    let event = endpoint.handle(Instant::now(), addr, None, None, valid, &mut Vec::new());
+    assert!(event.is_none(), "Ignore must not produce an event");
+    assert_eq!(
+        counts.values(),
+        [0, 0, 1, 1],
+        "a valid NEW_TOKEN is still decrypted and checked against the replay log"
+    );
+    assert!(policy.seen().last().unwrap().remote_address_validated());
+}
+
+#[test]
+fn authenticated_fast_retry_needs_no_token_aead() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let mut config = keyed_server_config();
+    authenticate_tokens(&mut config);
+    let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
+    let reject_versions = false;
+    let counts = instrument(&mut config, reject_versions);
+    config.initial_filter(Policy::new(InitialDecision::Retry));
+    let mut endpoint = server_endpoint(config);
+    for _ in 0..3 {
+        let mut out = Vec::new();
+        endpoint.handle(Instant::now(), addr, None, None, data.clone(), &mut out);
+        assert!(is_retry(&out), "fast path must answer with a Retry");
+    }
+    assert_eq!(
+        counts.values(),
+        [3, 3, 0, 0],
+        "authenticated Retry tokens need no AEAD work"
+    );
+
+    // The client's return with the token completes the handshake.
+    let policy = Policy::new(InitialDecision::Retry);
+    let mut config = keyed_server_config();
+    authenticate_tokens(&mut config);
+    config.initial_filter(policy.clone());
+    Pair::new(Default::default(), config).connect();
+    let seen = policy.seen();
+    assert_eq!(seen.len(), 2, "expected first flight and retried attempt");
+    assert!(seen[1].remote_address_validated() && !seen[1].may_retry());
+}
+
+/// An authenticated Retry token presented from another address fails its MAC, so the peer is
+/// merely unvalidated and the filter may retry it again.
+#[test]
+fn authenticated_retry_token_from_other_address_is_unvalidated() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let mut config = keyed_server_config();
+    authenticate_tokens(&mut config);
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    let token = authenticated_retry_token(&config, "[::1]:4434".parse().unwrap(), dst_cid);
+    let data = initial_packet(&config, dst_cid, &token);
+    let policy = Policy::new(InitialDecision::Retry);
+    config.initial_filter(policy.clone());
+    let mut out = Vec::new();
+    let event = server_endpoint(config).handle(Instant::now(), addr, None, None, data, &mut out);
+    assert!(
+        matches!(event, Some(DatagramEvent::Response(_))),
+        "expected a response datagram"
+    );
+    assert!(is_retry(&out), "an unvalidated peer may be retried");
+    let seen = policy.seen();
+    assert_eq!(seen.len(), 1, "decide must run once");
+    assert!(
+        !seen[0].remote_address_validated() && seen[0].may_retry(),
+        "a token bound to another address must not validate this one"
+    );
+}
+
+/// Authentication key counting signatures and verifications
+struct CountingMac {
+    inner: hmac::Key,
+    calls: AtomicUsize,
+}
+
+impl HmacKey for CountingMac {
+    fn sign(&self, data: &[u8], signature_out: &mut [u8]) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.sign(data, signature_out)
+    }
+
+    fn signature_len(&self) -> usize {
+        self.inner.signature_len()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.verify(data, signature)
+    }
+}
+
+/// With authenticated tokens, a closed gate precedes MAC work too, and Retry tokens that
+/// authenticate but are invalid for the packet skip `decide` like encrypted ones.
+#[test]
+fn authenticated_invalid_retry_tokens_skip_decide_but_not_the_gate() {
+    let addr: SocketAddr = "[::1]:4433".parse().unwrap();
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    for allow in [false, true] {
+        let mut config = keyed_server_config();
+        let mac = Arc::new(CountingMac {
+            inner: hmac::Key::new(hmac::HMAC_SHA256, &[7; 32]),
+            calls: AtomicUsize::new(0),
+        });
+        config.token_authentication_key(Some(mac.clone()));
+        let expired = config.token_key.encode(
+            TokenPayload::Retry {
+                address: addr,
+                orig_dst_cid: ConnectionId::new(&[9; 8]),
+                retry_src_cid: Some(dst_cid),
+                issued: config.time_source.now() - Duration::from_secs(3600),
+            },
+            &mut rand::rng(),
+        );
+        let wrong_dcid = authenticated_retry_token(&config, addr, ConnectionId::new(&[3; 8]));
+        let packets: Vec<_> = [expired, wrong_dcid]
+            .iter()
+            .map(|token| initial_packet(&config, dst_cid, token))
+            .collect();
+        let signatures = mac.calls.load(Ordering::Relaxed);
+        let reject_versions = false;
+        let counts = instrument(&mut config, reject_versions);
+        let policy = Policy::new(InitialDecision::Ignore);
+        policy.allow.store(allow, Ordering::Relaxed);
+        config.initial_filter(policy.clone());
+        let mut endpoint = server_endpoint(config);
+        for data in packets {
+            let mut out = Vec::new();
+            let event = endpoint.handle(Instant::now(), addr, None, None, data, &mut out);
+            assert_eq!(
+                event.is_some(),
+                allow,
+                "invalid Retry token answered only when admitted (allow: {allow})"
+            );
+            assert!(
+                !is_retry(&out),
+                "an invalid Retry token must not draw Retry"
+            );
+        }
+        assert!(
+            policy.seen().is_empty(),
+            "decide must not run for invalid Retry tokens"
+        );
+        let n = usize::from(allow);
+        assert_eq!(
+            mac.calls.load(Ordering::Relaxed) - signatures,
+            2 * n,
+            "only admitted tokens may be authenticated (allow: {allow})"
+        );
+        assert_eq!(
+            counts.values(),
+            [2 * n, 0, 0, 0],
+            "each admitted invalid Retry token costs Initial keys but no AEAD (allow: {allow})"
+        );
+    }
+}
+
+/// With authenticated tokens, gate rejection precedes all MAC, AEAD and replay-log work.
+#[test]
+fn authenticated_admission_rejection_does_no_token_work() {
+    let addr: SocketAddr = "[::1]:4433".parse().unwrap();
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    let mut config = keyed_server_config();
+    let mac = Arc::new(CountingMac {
+        inner: hmac::Key::new(hmac::HMAC_SHA256, &[7; 32]),
+        calls: AtomicUsize::new(0),
+    });
+    config.token_authentication_key(Some(mac.clone()));
+    let validation = true;
+    let mut forged = authenticated_retry_token(&config, addr, dst_cid);
+    *forged.last_mut().unwrap() ^= 1;
+    let packets: Vec<_> = [
+        authenticated_retry_token(&config, addr, dst_cid),
+        issue_token(&config, addr, validation),
+        forged,
+    ]
+    .iter()
+    .map(|token| initial_packet(&config, dst_cid, token))
+    .collect();
+    let signatures = mac.calls.load(Ordering::Relaxed);
+    let reject_versions = false;
+    let counts = instrument(&mut config, reject_versions);
+    let policy = Policy::new(InitialDecision::Proceed);
+    policy.allow.store(false, Ordering::Relaxed);
+    config.initial_filter(policy.clone());
+    let mut endpoint = server_endpoint(config);
+    for data in packets {
+        let mut out = Vec::new();
+        let event = endpoint.handle(Instant::now(), addr, None, None, data, &mut out);
+        assert!(
+            event.is_none() && out.is_empty(),
+            "gate-rejected initial drew a response"
+        );
+    }
+    assert_eq!(
+        mac.calls.load(Ordering::Relaxed),
+        signatures,
+        "gate rejection must precede MAC work"
+    );
+    assert_eq!(
+        counts.values(),
+        [0; 4],
+        "gate rejection must precede all crypto and replay-log work"
+    );
+    assert!(policy.seen().is_empty());
 }

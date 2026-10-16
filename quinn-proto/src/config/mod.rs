@@ -210,7 +210,7 @@ pub struct ServerConfig {
     /// Configuration for sending and handling validation tokens
     pub validation_token: ValidationTokenConfig,
 
-    /// Used to generate one-time AEAD keys to protect handshake tokens
+    /// Keys protecting handshake tokens: the AEAD key and, if enabled, the authentication key
     pub(crate) token_key: TokenKey,
 
     pub(crate) initial_filter: Option<Arc<dyn InitialFilter>>,
@@ -286,9 +286,41 @@ impl ServerConfig {
         self
     }
 
-    /// Private key used to authenticate data included in handshake tokens
+    /// Private key used to protect handshake tokens
+    ///
+    /// By default it encrypts and authenticates every token. With
+    /// [`Self::token_authentication_key`] set, it only encrypts NEW_TOKENs, and Retry tokens
+    /// depend on the authentication key alone: changing this key then invalidates outstanding
+    /// NEW_TOKENs but not Retry tokens.
     pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-        self.token_key = TokenKey::new(value);
+        self.token_key.set_encryption(value);
+        self
+    }
+
+    /// Authenticate handshake tokens with a MAC key, or keep the default encrypted-only format
+    ///
+    /// Disabled (`None`) by default. When enabled, Retry tokens are authenticated but not
+    /// encrypted, binding the client's address and port, connection IDs and issuance time.
+    /// NEW_TOKENs stay encrypted under [`Self::token_key`] and gain an outer MAC bound to the
+    /// client's IP. Tokens that fail MAC authentication are then rejected without token-key
+    /// derivation or decryption, which matters when token-bearing Initials are processed under
+    /// load, e.g. by an [`InitialFilter`]. Authenticated tokens still undergo expiry and the
+    /// other checks: an expired NEW_TOKEN is still decrypted, and an expired Retry token still
+    /// draws an encrypted INVALID_TOKEN close.
+    ///
+    /// The key must produce 32-byte tags, such as HMAC-SHA256, and be independent of
+    /// [`Self::token_key`]. Tokens in the other format are treated as absent, so enabling or
+    /// disabling this invalidates outstanding tokens. Changing this key invalidates all of them;
+    /// changing [`Self::token_key`] only invalidates NEW_TOKENs. Servers sharing tokens must agree
+    /// on both keys and on this setting. Unlike the default format, a Retry token presented from
+    /// a different address cannot be told apart from a forgery, so the client is treated as
+    /// unvalidated rather than refused with INVALID_TOKEN.
+    ///
+    /// # Panics
+    ///
+    /// If the key's tags are not 32 bytes long.
+    pub fn token_authentication_key(&mut self, key: Option<Arc<dyn HmacKey>>) -> &mut Self {
+        self.token_key.set_authentication(key);
         self
     }
 

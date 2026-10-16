@@ -133,9 +133,10 @@ derivation and a response, so only the global budget bounds them. The example al
 Initials outright.
 
 `decide` runs after token validation, so an `Ignore` there has already paid the token cost: a key
-derivation and decryption per token, forged or not. The example budgets there per class: peers
-with a valid token get their own budget, so a retried client's return doesn't compete with new
-strangers. Validated peers still need a budget: a Retry token can be presented on any number of
+derivation and decryption per token, forged or not. With `ServerConfig::token_authentication_key`
+set, a token that fails its MAC is rejected without either. The example budgets there per class:
+peers with a valid token get their own budget, so a retried client's return doesn't compete with
+new strangers. Validated peers still need a budget: a Retry token can be presented on any number of
 Initials within its lifetime. Packets for connections the endpoint already knows never reach the
 filter.
 
