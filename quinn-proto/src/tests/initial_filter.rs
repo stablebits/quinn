@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     crypto::{HandshakeTokenKey, Keys, UnsupportedVersion},
-    token::{Token, TokenPayload},
+    token::TokenPayload,
 };
 #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
 use aws_lc_rs::hkdf;
@@ -202,7 +202,7 @@ fn issue_token(config: &ServerConfig, addr: SocketAddr, validation: bool) -> Vec
             issued: config.time_source.now(),
         }
     };
-    Token::new(payload, &mut rand::rng()).encode(&*config.token_key)
+    config.token_key.encode(payload, &mut rand::rng())
 }
 
 /// An encrypted Retry token for `addr`, issued at `issued`
@@ -212,7 +212,7 @@ fn retry_token(config: &ServerConfig, addr: SocketAddr, issued: SystemTime) -> V
         orig_dst_cid: ConnectionId::new(&[1; 8]),
         issued,
     };
-    Token::new(payload, &mut rand::rng()).encode(&*config.token_key)
+    config.token_key.encode(payload, &mut rand::rng())
 }
 
 fn is_retry(datagram: &[u8]) -> bool {

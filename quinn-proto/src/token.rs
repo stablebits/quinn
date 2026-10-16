@@ -2,6 +2,7 @@ use std::{
     fmt,
     mem::size_of,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
 };
 
 use bytes::{Buf, BufMut, Bytes};
@@ -142,7 +143,7 @@ impl IncomingToken {
         //
         // > If the token is invalid, then the server SHOULD proceed as if the client did not have
         // > a validated address, including potentially sending a Retry packet.
-        let Some(retry) = Token::decode(&*server_config.token_key, token) else {
+        let Some(retry) = server_config.token_key.decode(token) else {
             return Ok(unvalidated);
         };
 
@@ -198,6 +199,26 @@ impl IncomingToken {
 ///
 /// The connection cannot be established.
 pub(crate) struct InvalidRetryTokenError;
+
+/// Key protecting handshake tokens, prepared when configuring the server
+#[derive(Clone)]
+pub(crate) struct TokenKey {
+    encryption: Arc<dyn HandshakeTokenKey>,
+}
+
+impl TokenKey {
+    pub(crate) fn new(encryption: Arc<dyn HandshakeTokenKey>) -> Self {
+        Self { encryption }
+    }
+
+    pub(crate) fn encode(&self, payload: TokenPayload, rng: &mut impl Rng) -> Vec<u8> {
+        Token::new(payload, rng).encode(&*self.encryption)
+    }
+
+    fn decode(&self, token: &[u8]) -> Option<Token> {
+        Token::decode(&*self.encryption, token)
+    }
+}
 
 /// Retry or validation token
 pub(crate) struct Token {

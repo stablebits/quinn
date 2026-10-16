@@ -37,7 +37,7 @@ use crate::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
         EndpointEvent, EndpointEventInner, IssuedCid,
     },
-    token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
+    token::{IncomingToken, InvalidRetryTokenError, TokenPayload},
     transport_parameters::{PreferredAddress, TransportParameters},
 };
 
@@ -960,7 +960,7 @@ impl Endpoint {
             orig_dst_cid,
             issued: server_config.time_source.now(),
         };
-        let token = Token::new(payload, &mut self.rng).encode(&*server_config.token_key);
+        let token = server_config.token_key.encode(payload, &mut self.rng);
 
         let header = Header::Retry {
             src_cid: loc_cid,
