@@ -15,11 +15,11 @@ pub trait InitialFilter: Send + Sync {
     /// unauthenticated. The default imposes no limit; override to bound work with
     /// a global budget. Per-source limits alone do not bound spoofed-source traffic.
     ///
-    /// Some admitted Initials never reach [`Self::decide`]: those with a malformed header, and
-    /// those carrying a Retry token that decrypts but is invalid for the packet, e.g. expired
-    /// or issued for another address. As without a filter, they are refused with an encrypted
-    /// CONNECTION_CLOSE, costing Initial-key derivation and a response, so only a budget here
-    /// bounds them.
+    /// Some admitted Initials never reach [`Self::decide`]: those with a
+    /// [malformed](InitialMetadata::is_malformed) header, and those carrying a Retry token that
+    /// decrypts but is invalid for the packet, e.g. expired or issued for another address. As
+    /// without a filter, they are refused with an encrypted CONNECTION_CLOSE, costing
+    /// Initial-key derivation and a response, so only a budget here bounds them.
     fn allow_initial(&self, _metadata: &InitialMetadata) -> bool {
         true
     }
@@ -65,6 +65,7 @@ pub struct InitialMetadata {
     pub(crate) local_ip: Option<IpAddr>,
     pub(crate) received_at: Instant,
     pub(crate) datagram_len: usize,
+    pub(crate) malformed: bool,
 }
 
 impl InitialMetadata {
@@ -83,6 +84,15 @@ impl InitialMetadata {
     /// Size of the UDP datagram containing the Initial.
     pub fn datagram_len(&self) -> usize {
         self.datagram_len
+    }
+    /// Whether the header fails the cheap checks made before any decryption, currently a
+    /// client-chosen destination CID shorter than 8 bytes
+    ///
+    /// If admitted, the Initial skips [`InitialFilter::decide`] and is refused with an encrypted
+    /// CONNECTION_CLOSE, costing Initial-key derivation and a response. `false` does not mean the
+    /// packet or its token is valid: those are only checked later.
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
     }
 }
 

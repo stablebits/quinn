@@ -471,6 +471,7 @@ impl Endpoint {
                 local_ip: addresses.local_ip,
                 received_at: event.now,
                 datagram_len,
+                malformed: early_validation.is_err(),
             };
             if !filter.allow_initial(&metadata) {
                 trace!("dropping initial for connection {dst_cid} per admission gate");

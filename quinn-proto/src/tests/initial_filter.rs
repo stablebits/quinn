@@ -427,49 +427,87 @@ fn fast_retry_provider_fallback_and_replacement() {
     );
 }
 
+/// Malformed Initials reach the gate flagged, skip `decide`, and by default draw the same encrypted
+/// close as without a filter; a gate that drops them avoids Initial-key derivation entirely.
 #[test]
-fn malformed_initial_is_budgeted_and_no_filter_retains_close() {
+fn malformed_initial_is_gated_and_closed_by_default() {
+    /// Uses the default `allow_initial`
+    struct DefaultGate;
+    impl InitialFilter for DefaultGate {
+        fn decide(&self, _: &InitialContext) -> InitialDecision {
+            panic!("malformed initials must not reach decide")
+        }
+    }
+    /// Drops malformed initials, recording what the gate saw
+    struct DropMalformed(Mutex<Vec<bool>>);
+    impl InitialFilter for DropMalformed {
+        fn allow_initial(&self, meta: &InitialMetadata) -> bool {
+            self.0.lock().unwrap().push(meta.is_malformed());
+            !meta.is_malformed()
+        }
+        fn decide(&self, _: &InitialContext) -> InitialDecision {
+            InitialDecision::Ignore
+        }
+    }
+
     let addr = "[::1]:4433".parse().unwrap();
-    let mut data = BytesMut::from(hex!("c4 00000001 00 00 00 3f").as_ref());
-    data.resize(MIN_INITIAL_SIZE.into(), 0);
-    for allow in [false, true] {
+    // Zero-length DCID: invalid for a client's first Initial regardless of contents.
+    let mut malformed = BytesMut::from(hex!("c4 00000001 00 00 00 3f").as_ref());
+    malformed.resize(MIN_INITIAL_SIZE.into(), 0);
+
+    for (filter, closed) in [
+        (None, true),
+        (Some(Arc::new(DefaultGate) as Arc<dyn InitialFilter>), true),
+        (
+            Some(Policy::new(InitialDecision::Retry) as Arc<dyn InitialFilter>),
+            true,
+        ),
+        (
+            Some(Arc::new(DropMalformed(Mutex::default())) as Arc<dyn InitialFilter>),
+            false,
+        ),
+    ] {
         let mut config = keyed_server_config();
         let reject_versions = false;
         let counts = instrument(&mut config, reject_versions);
-        let policy = Policy::new(InitialDecision::Ignore);
-        policy.allow.store(allow, Ordering::Relaxed);
-        config.initial_filter(policy);
-        let result = server_endpoint(config).handle(
+        if let Some(filter) = filter {
+            config.initial_filter(filter);
+        }
+        let mut out = Vec::new();
+        let event = server_endpoint(config).handle(
             Instant::now(),
             addr,
             None,
             None,
-            data.clone(),
-            &mut Vec::new(),
+            malformed.clone(),
+            &mut out,
         );
         assert_eq!(
-            result.is_some(),
-            allow,
-            "malformed initial answered only when admitted (allow: {allow})"
+            matches!(event, Some(DatagramEvent::Response(_))),
+            closed,
+            "malformed initial closed only when admitted (closed: {closed})"
+        );
+        assert!(
+            !closed || !is_retry(&out),
+            "malformed initial must not draw Retry"
         );
         assert_eq!(
             counts.values(),
-            [usize::from(allow), 0, 0, 0],
-            "malformed initial must derive keys only when admitted (allow: {allow})"
+            [usize::from(closed), 0, 0, 0],
+            "malformed initial must derive keys only when admitted (closed: {closed})"
         );
     }
-    let event = server_endpoint(keyed_server_config()).handle(
-        Instant::now(),
-        addr,
-        None,
-        None,
-        data,
-        &mut Vec::new(),
-    );
-    assert!(
-        matches!(event, Some(DatagramEvent::Response(_))),
-        "expected a response datagram"
-    );
+
+    // The flag is raised only for malformed initials.
+    let gate = Arc::new(DropMalformed(Mutex::default()));
+    let mut config = keyed_server_config();
+    let valid = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
+    config.initial_filter(gate.clone());
+    let mut endpoint = server_endpoint(config);
+    for data in [malformed, valid] {
+        endpoint.handle(Instant::now(), addr, None, None, data, &mut Vec::new());
+    }
+    assert_eq!(*gate.0.lock().unwrap(), [true, false]);
 }
 
 /// An authenticated Retry token bound to another address draws INVALID_TOKEN, bypassing the filter,
