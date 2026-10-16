@@ -75,6 +75,8 @@ impl Counts {
 }
 
 /// Crypto provider counting expensive operations, optionally rejecting every version
+///
+/// Intentionally uses the default `supports_version`, exercising custom-provider compatibility.
 struct SpyCrypto {
     inner: Arc<dyn crypto::ServerConfig>,
     counts: Arc<Counts>,
