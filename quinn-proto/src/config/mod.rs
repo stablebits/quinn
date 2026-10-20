@@ -23,6 +23,7 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
+    token::TokenCodec,
 };
 
 mod initial;
@@ -209,8 +210,8 @@ pub struct ServerConfig {
     /// Configuration for sending and handling validation tokens
     pub validation_token: ValidationTokenConfig,
 
-    /// Used to generate one-time AEAD keys to protect handshake tokens
-    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
+    /// Encodes and decodes handshake tokens
+    pub(crate) token_codec: TokenCodec,
 
     pub(crate) initial_filter: Option<Arc<dyn InitialFilter>>,
 
@@ -243,7 +244,7 @@ impl ServerConfig {
             transport: Arc::new(TransportConfig::default()),
             crypto,
 
-            token_key,
+            token_codec: TokenCodec::new(token_key),
             initial_filter: None,
             retry_token_lifetime: Duration::from_secs(15),
 
@@ -287,7 +288,7 @@ impl ServerConfig {
 
     /// Private key used to authenticate data included in handshake tokens
     pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-        self.token_key = value;
+        self.token_codec = TokenCodec::new(value);
         self
     }
 
