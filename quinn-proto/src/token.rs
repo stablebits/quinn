@@ -143,21 +143,30 @@ impl IncomingToken {
         //
         // > If the token is invalid, then the server SHOULD proceed as if the client did not have
         // > a validated address, including potentially sending a Retry packet.
-        let Some(retry) = server_config.token_codec.decode(token) else {
+        let Some(retry) = server_config.token_codec.decode(token, remote_address) else {
             return Ok(unvalidated);
         };
 
         // Validate token, then convert into Self
         match retry.payload {
+            // An authenticated Retry token binds the address in its MAC, so one presented from
+            // another address fails to decode above and leaves the client unvalidated
             TokenPayload::Retry {
                 address,
                 orig_dst_cid,
+                retry_src_cid,
                 issued,
             } => {
                 if address != remote_address {
                     return Err(InvalidRetryTokenError);
                 }
-                if issued + server_config.retry_token_lifetime < server_config.time_source.now() {
+                if retry_src_cid.is_some_and(|cid| cid != dst_cid) {
+                    return Err(InvalidRetryTokenError);
+                }
+                if issued
+                    .checked_add(server_config.retry_token_lifetime)
+                    .is_none_or(|expires| expires < server_config.time_source.now())
+                {
                     return Err(InvalidRetryTokenError);
                 }
 
@@ -201,30 +210,167 @@ impl IncomingToken {
 pub(crate) struct InvalidRetryTokenError;
 
 /// Encodes and decodes handshake tokens
+///
+/// Tokens are encrypted by default. With an authentication key, Retry tokens are authenticated
+/// only, and NEW_TOKENs are encrypted, then authenticated.
 #[derive(Clone)]
 pub(crate) struct TokenCodec {
     encryption: Arc<dyn HandshakeTokenKey>,
+    authentication: Option<Arc<dyn HmacKey>>,
 }
 
 impl TokenCodec {
     pub(crate) fn new(encryption: Arc<dyn HandshakeTokenKey>) -> Self {
-        Self { encryption }
+        Self {
+            encryption,
+            authentication: None,
+        }
+    }
+
+    pub(crate) fn set_encryption(&mut self, encryption: Arc<dyn HandshakeTokenKey>) {
+        self.encryption = encryption;
+    }
+
+    /// Select the authenticated token format with `Some`, or the encrypted-only format with `None`
+    pub(crate) fn set_authentication(&mut self, authentication: Option<Arc<dyn HmacKey>>) {
+        if let Some(key) = &authentication {
+            assert_eq!(
+                key.signature_len(),
+                TOKEN_TAG_LEN,
+                "token authentication key must produce {TOKEN_TAG_LEN}-byte tags"
+            );
+        }
+        self.authentication = authentication;
     }
 
     pub(crate) fn encode(&self, payload: TokenPayload, rng: &mut impl Rng) -> Vec<u8> {
-        Token::new(payload, rng).encode(&*self.encryption)
+        let Some(key) = &self.authentication else {
+            return Token::new(payload, rng).encode(&*self.encryption);
+        };
+
+        let mut token = Vec::with_capacity(128);
+        token.put_u8(TOKEN_VERSION);
+        let (kind, address) = match payload {
+            TokenPayload::Retry {
+                address,
+                orig_dst_cid,
+                retry_src_cid,
+                issued,
+            } => {
+                token.put_u8(TokenType::Retry as u8);
+                orig_dst_cid.encode_long(&mut token);
+                retry_src_cid
+                    .expect("Retry source CID required when issuing a token")
+                    .encode_long(&mut token);
+                // Milliseconds, unlike encrypted-only tokens' seconds, allow short lifetimes
+                token.put_u64(
+                    issued
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .try_into()
+                        .expect("token issuance time fits in u64 milliseconds"),
+                );
+                (TokenType::Retry, address)
+            }
+            TokenPayload::Validation { ip, .. } => {
+                token.put_u8(TokenType::Validation as u8);
+                // Keep the encrypted token for its confidentiality and replay-log nonce. The outer
+                // MAC rejects forgeries before per-token key derivation.
+                token.extend_from_slice(&Token::new(payload, rng).encode(&*self.encryption));
+                (TokenType::Validation, SocketAddr::new(ip, 0))
+            }
+        };
+        assert!(token.len() + TOKEN_TAG_LEN <= MAX_TOKEN_LEN);
+        let (input, len) = Self::authentication_data(&token, kind, address);
+        let mut tag = [0; TOKEN_TAG_LEN];
+        key.sign(&input[..len], &mut tag);
+        token.extend_from_slice(&tag);
+        token
     }
 
-    fn decode(&self, token: &[u8]) -> Option<Token> {
-        Token::decode(&*self.encryption, token)
+    fn decode(&self, token: &[u8], address: SocketAddr) -> Option<Token> {
+        let Some(key) = &self.authentication else {
+            return Token::decode(&*self.encryption, token);
+        };
+
+        // No fallback to the encrypted-only format: forgeries could then skip the MAC check
+        if !(2 + TOKEN_TAG_LEN..=MAX_TOKEN_LEN).contains(&token.len()) || token[0] != TOKEN_VERSION
+        {
+            return None;
+        }
+        let kind = TokenType::from_byte(token[1])?;
+        // Version, type, two length-prefixed CIDs and an eight-byte timestamp
+        if matches!(kind, TokenType::Retry)
+            && !(12 + TOKEN_TAG_LEN..=12 + 2 * crate::MAX_CID_SIZE + TOKEN_TAG_LEN)
+                .contains(&token.len())
+        {
+            return None;
+        }
+        let (body, tag) = token.split_at(token.len() - TOKEN_TAG_LEN);
+        let (input, len) = Self::authentication_data(body, kind, address);
+        key.verify(&input[..len], tag).ok()?;
+
+        let mut reader = &body[2..];
+        match kind {
+            TokenType::Retry => {
+                let orig_dst_cid = ConnectionId::decode_long(&mut reader)?;
+                let retry_src_cid = ConnectionId::decode_long(&mut reader)?;
+                let issued = UNIX_EPOCH
+                    .checked_add(Duration::from_millis((&mut reader).get::<u64>().ok()?))?;
+                if !reader.is_empty() {
+                    return None;
+                }
+                Some(Token {
+                    payload: TokenPayload::Retry {
+                        address,
+                        orig_dst_cid,
+                        retry_src_cid: Some(retry_src_cid),
+                        issued,
+                    },
+                    nonce: 0,
+                })
+            }
+            TokenType::Validation => {
+                let token = Token::decode(&*self.encryption, reader)?;
+                // Reject an encrypted Retry token wrapped as a NEW_TOKEN
+                matches!(token.payload, TokenPayload::Validation { .. }).then_some(token)
+            }
+        }
+    }
+
+    /// MAC input: a domain label, the token type, the client's IP (and port, for Retry tokens)
+    /// and the token body
+    fn authentication_data(
+        body: &[u8],
+        kind: TokenType,
+        address: SocketAddr,
+    ) -> ([u8; MAX_TOKEN_LEN + 64], usize) {
+        let mut input = [0; MAX_TOKEN_LEN + 64];
+        let mut buf = &mut input[..];
+        buf.put_slice(b"quinn-token-v1");
+        buf.put_u8(kind as u8);
+        encode_ip(&mut buf, address.ip());
+        if matches!(kind, TokenType::Retry) {
+            buf.put_u16(address.port());
+        }
+        buf.put_slice(body);
+        let len = MAX_TOKEN_LEN + 64 - buf.len();
+        (input, len)
     }
 }
 
-/// Retry or validation token
+/// First byte of authenticated tokens
+const TOKEN_VERSION: u8 = 1;
+const TOKEN_TAG_LEN: usize = 32;
+/// Longest authenticated token accepted
+const MAX_TOKEN_LEN: usize = 1024;
+
+/// Decoded token, or a token to be encoded in the encrypted-only format
 pub(crate) struct Token {
-    /// Content that is encrypted from the client
+    /// Content, encrypted or authenticated
     pub(crate) payload: TokenPayload,
-    /// Randomly generated value, which must be unique, and is visible to the client
+    /// Unique nonce for encrypted tokens; unused (zero) for authenticated Retry tokens
     nonce: u128,
 }
 
@@ -247,6 +393,7 @@ impl Token {
                 address,
                 orig_dst_cid,
                 issued,
+                ..
             } => {
                 buf.put_u8(TokenType::Retry as u8);
                 encode_addr(&mut buf, address);
@@ -287,6 +434,7 @@ impl Token {
             TokenType::Retry => TokenPayload::Retry {
                 address: decode_addr(&mut reader)?,
                 orig_dst_cid: ConnectionId::decode_long(&mut reader)?,
+                retry_src_cid: None,
                 issued: decode_unix_secs(&mut reader)?,
             },
             TokenType::Validation => TokenPayload::Validation {
@@ -304,7 +452,7 @@ impl Token {
     }
 }
 
-/// Content of a [`Token`] that is encrypted from the client
+/// Content of a [`Token`]
 pub(crate) enum TokenPayload {
     /// Token originating from a Retry packet
     Retry {
@@ -312,6 +460,8 @@ pub(crate) enum TokenPayload {
         address: SocketAddr,
         /// The destination connection ID set in the very first packet from the client
         orig_dst_cid: ConnectionId,
+        /// The source CID of the Retry packet, absent in encrypted-only tokens
+        retry_src_cid: Option<ConnectionId>,
         /// The time at which this token was issued
         issued: SystemTime,
     },
@@ -350,7 +500,7 @@ fn decode_addr<B: Buf>(buf: &mut B) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-fn encode_ip(buf: &mut Vec<u8>, ip: IpAddr) {
+fn encode_ip(buf: &mut impl BufMut, ip: IpAddr) {
     match ip {
         IpAddr::V4(x) => {
             buf.put_u8(0);
@@ -433,11 +583,13 @@ impl fmt::Display for ResetToken {
 
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod test {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
-    use aws_lc_rs::hkdf;
+    use aws_lc_rs::{hkdf, hmac};
     #[cfg(feature = "ring")]
-    use ring::hkdf;
+    use ring::{hkdf, hmac};
 
     fn token_round_trip(payload: TokenPayload) -> TokenPayload {
         let rng = &mut rand::rng();
@@ -465,12 +617,14 @@ mod test {
         let payload_1 = TokenPayload::Retry {
             address: address_1,
             orig_dst_cid: orig_dst_cid_1,
+            retry_src_cid: None,
             issued: issued_1,
         };
         let TokenPayload::Retry {
             address: address_2,
             orig_dst_cid: orig_dst_cid_2,
             issued: issued_2,
+            ..
         } = token_round_trip(payload_1)
         else {
             panic!("token decoded as wrong variant");
@@ -523,5 +677,196 @@ mod test {
 
         // Assert: garbage sealed data returns err
         assert!(Token::decode(&prk, &invalid_token).is_none());
+    }
+
+    struct CountingKey {
+        inner: hkdf::Prk,
+        aead_calls: AtomicUsize,
+    }
+
+    impl CountingKey {
+        fn new(seed: u8) -> Arc<Self> {
+            Arc::new(Self {
+                inner: hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&[seed; 32]),
+                aead_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl HandshakeTokenKey for CountingKey {
+        fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn crate::crypto::AeadKey> {
+            self.aead_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.aead_from_hkdf(random_bytes)
+        }
+    }
+
+    /// `TokenCodec` with authenticated tokens enabled
+    fn authenticated(encryption: Arc<dyn HandshakeTokenKey>, seed: u8) -> TokenCodec {
+        let mut codec = TokenCodec::new(encryption);
+        codec.set_authentication(Some(Arc::new(hmac::Key::new(
+            hmac::HMAC_SHA256,
+            &[seed; 32],
+        ))));
+        codec
+    }
+
+    fn retry_payload(address: SocketAddr) -> TokenPayload {
+        TokenPayload::Retry {
+            address,
+            orig_dst_cid: ConnectionId::new(&[1; 20]),
+            retry_src_cid: Some(ConnectionId::new(&[2; 8])),
+            issued: UNIX_EPOCH + Duration::from_millis(42_123),
+        }
+    }
+
+    #[test]
+    fn mac_retry_round_trip_without_aead() {
+        let provider = CountingKey::new(42);
+        let key = authenticated(provider.clone(), 42);
+        for address in ["127.0.0.1:4433", "[::1]:4433"] {
+            let address = address.parse().unwrap();
+            let encoded = key.encode(retry_payload(address), &mut rand::rng());
+            assert_eq!(encoded.len(), 72);
+            let decoded = key.decode(&encoded, address).unwrap();
+            let TokenPayload::Retry {
+                orig_dst_cid,
+                retry_src_cid,
+                issued,
+                ..
+            } = decoded.payload
+            else {
+                panic!("wrong token kind");
+            };
+            assert_eq!(orig_dst_cid, ConnectionId::new(&[1; 20]));
+            assert_eq!(retry_src_cid, Some(ConnectionId::new(&[2; 8])));
+            assert_eq!(issued, UNIX_EPOCH + Duration::from_millis(42_123));
+
+            let mut changed_port = address;
+            changed_port.set_port(4434);
+            assert!(key.decode(&encoded, changed_port).is_none());
+            assert!(
+                key.decode(&encoded, "192.0.2.1:4433".parse().unwrap())
+                    .is_none()
+            );
+        }
+        assert_eq!(provider.aead_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn forged_tokens_never_reach_aead() {
+        let provider = CountingKey::new(42);
+        let key = authenticated(provider.clone(), 42);
+        let address = "127.0.0.1:4433".parse().unwrap();
+        for payload in [
+            retry_payload(address),
+            TokenPayload::Validation {
+                ip: address.ip(),
+                issued: UNIX_EPOCH,
+            },
+        ] {
+            let encoded = key.encode(payload, &mut rand::rng());
+            let calls = provider.aead_calls.load(Ordering::Relaxed);
+            for i in 0..encoded.len() {
+                let mut forged = encoded.clone();
+                forged[i] ^= 1;
+                assert!(key.decode(&forged, address).is_none());
+                assert!(key.decode(&encoded[..i], address).is_none());
+            }
+            let mut extended = encoded;
+            extended.push(0);
+            assert!(key.decode(&extended, address).is_none());
+            assert_eq!(provider.aead_calls.load(Ordering::Relaxed), calls);
+        }
+
+        let calls = provider.aead_calls.load(Ordering::Relaxed);
+        for len in 0..=MAX_TOKEN_LEN + 1 {
+            for kind in [0, 1, 255] {
+                let mut forged = vec![0; len];
+                if len >= 2 {
+                    forged[..2].copy_from_slice(&[TOKEN_VERSION, kind]);
+                }
+                assert!(key.decode(&forged, address).is_none());
+            }
+        }
+        // Encrypted-only tokens and unrecognized format bytes cannot select a fallback decryptor.
+        let legacy = Token::new(retry_payload(address), &mut rand::rng()).encode(&provider.inner);
+        assert!(key.decode(&legacy, address).is_none());
+        assert_eq!(provider.aead_calls.load(Ordering::Relaxed), calls);
+    }
+
+    #[test]
+    fn validation_mac_preserves_nonce_and_allows_port_change() {
+        let provider = CountingKey::new(42);
+        let key = authenticated(provider.clone(), 42);
+        for (address, expected_len) in [("127.0.0.1:4433", 80), ("[::1]:4433", 92)] {
+            let address: SocketAddr = address.parse().unwrap();
+            let payload = TokenPayload::Validation {
+                ip: address.ip(),
+                issued: UNIX_EPOCH + Duration::from_secs(42),
+            };
+            let encoded = key.encode(payload, &mut rand::rng());
+            assert_eq!(encoded.len(), expected_len);
+            let decoded = key.decode(&encoded, address).unwrap();
+            assert!(
+                matches!(decoded.payload, TokenPayload::Validation { ip, .. } if ip == address.ip())
+            );
+            let mut new_port = address;
+            new_port.set_port(4434);
+            assert_eq!(key.decode(&encoded, new_port).unwrap().nonce, decoded.nonce);
+            let calls = provider.aead_calls.load(Ordering::Relaxed);
+            assert!(
+                key.decode(&encoded, "192.0.2.1:4433".parse().unwrap())
+                    .is_none()
+            );
+            assert_eq!(provider.aead_calls.load(Ordering::Relaxed), calls);
+        }
+    }
+
+    #[test]
+    fn key_rotations_are_independent() {
+        let address: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let key = authenticated(CountingKey::new(42), 42);
+        let retry = key.encode(retry_payload(address), &mut rand::rng());
+        let new_token = key.encode(
+            TokenPayload::Validation {
+                ip: address.ip(),
+                issued: UNIX_EPOCH + Duration::from_secs(42),
+            },
+            &mut rand::rng(),
+        );
+
+        // Retry tokens are MAC-only, so a new encryption key invalidates NEW_TOKENs alone.
+        let mut new_encryption = key.clone();
+        new_encryption.set_encryption(CountingKey::new(43));
+        assert!(new_encryption.decode(&retry, address).is_some());
+        assert!(new_encryption.decode(&new_token, address).is_none());
+
+        // A new authentication key invalidates both.
+        let new_authentication = authenticated(CountingKey::new(42), 43);
+        assert!(new_authentication.decode(&retry, address).is_none());
+        assert!(new_authentication.decode(&new_token, address).is_none());
+
+        // So does returning to the encrypted-only format.
+        let mut disabled = key.clone();
+        disabled.set_authentication(None);
+        assert!(disabled.decode(&retry, address).is_none());
+        assert!(disabled.decode(&new_token, address).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "token authentication key must produce 32-byte tags")]
+    fn short_authentication_tags_are_rejected() {
+        struct ShortTags;
+        impl HmacKey for ShortTags {
+            fn sign(&self, _: &[u8], _: &mut [u8]) {}
+            fn signature_len(&self) -> usize {
+                16
+            }
+            fn verify(&self, _: &[u8], _: &[u8]) -> Result<(), crate::crypto::CryptoError> {
+                Ok(())
+            }
+        }
+        let mut key = TokenCodec::new(CountingKey::new(42));
+        key.set_authentication(Some(Arc::new(ShortTags)));
     }
 }

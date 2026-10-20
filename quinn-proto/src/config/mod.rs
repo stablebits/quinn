@@ -287,8 +287,35 @@ impl ServerConfig {
     }
 
     /// Private key used to authenticate data included in handshake tokens
+    ///
+    /// With [`Self::token_authentication_key`] set, it protects only NEW_TOKENs.
     pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-        self.token_codec = TokenCodec::new(value);
+        self.token_codec.set_encryption(value);
+        self
+    }
+
+    /// Authenticate handshake tokens with a MAC key
+    ///
+    /// None by default. When set, Retry tokens are authenticated but not encrypted, binding the
+    /// client's address and port, both connection IDs and the issue time. NEW_TOKENs stay
+    /// encrypted under [`Self::token_key`] and gain an outer MAC bound to the client's IP. A token
+    /// that fails the MAC is rejected without key derivation, decryption or replay-log access, so
+    /// forged tokens are cheap to reject, e.g. in an [`InitialFilter`].
+    ///
+    /// The key must produce 32-byte tags, e.g. HMAC-SHA256, and be independent of
+    /// [`Self::token_key`]. Tokens in the other format are treated as absent, so enabling or
+    /// disabling this invalidates outstanding tokens. So does changing this key, while changing
+    /// [`Self::token_key`] invalidates only NEW_TOKENs. Servers sharing tokens must agree on both.
+    ///
+    /// A Retry token presented from another address, e.g. after NAT rebinding, fails the MAC, so
+    /// the client is unvalidated rather than refused with INVALID_TOKEN. A client accepts only
+    /// one Retry, so if it's retried again, the attempt times out instead of failing fast.
+    ///
+    /// # Panics
+    ///
+    /// If the key's tags aren't 32 bytes long.
+    pub fn token_authentication_key(&mut self, key: Option<Arc<dyn HmacKey>>) -> &mut Self {
+        self.token_codec.set_authentication(key);
         self
     }
 

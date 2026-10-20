@@ -202,14 +202,26 @@ fn validation_token(config: &ServerConfig, addr: SocketAddr) -> Vec<u8> {
     config.token_codec.encode(payload, &mut rand::rng())
 }
 
-/// A Retry token for `addr`, issued at `issued`
-fn retry_token(config: &ServerConfig, addr: SocketAddr, issued: SystemTime) -> Vec<u8> {
+/// A Retry token for `addr`, issued at `issued`, for Initials with DCID `dst_cid`
+fn retry_token(
+    config: &ServerConfig,
+    addr: SocketAddr,
+    dst_cid: ConnectionId,
+    issued: SystemTime,
+) -> Vec<u8> {
     let payload = TokenPayload::Retry {
         address: addr,
-        orig_dst_cid: ConnectionId::new(&[1; 8]),
+        // The client's first DCID, before the Retry
+        orig_dst_cid: ConnectionId::new(&[9; 8]),
+        retry_src_cid: Some(dst_cid),
         issued,
     };
     config.token_codec.encode(payload, &mut rand::rng())
+}
+
+/// Enable authenticated tokens, with a MAC key independent of [`token_key`]
+fn authenticate_tokens(config: &mut ServerConfig) {
+    config.token_authentication_key(Some(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &[7; 32]))));
 }
 
 #[test]
@@ -220,7 +232,7 @@ fn admission_rejects_all_tokens_before_crypto_and_replay_log() {
     let tokens = [
         vec![],
         vec![7; 80],
-        retry_token(&config, addr, config.time_source.now()),
+        retry_token(&config, addr, dst_cid, config.time_source.now()),
         validation_token(&config, addr),
     ];
     let packets: Vec<_> = tokens
@@ -309,16 +321,19 @@ fn ignored_new_token_is_used_up() {
     assert_eq!(validated, [true, false]);
 }
 
-/// Manual Retry through `Incoming`, and fast Retry through the filter
+/// Manual Retry through `Incoming`, and fast Retry through the filter, with either token format
 #[test]
 fn filtered_handshake_after_retry() {
-    for fast in [false, true] {
+    for (fast, mac) in [(false, false), (true, false), (false, true), (true, true)] {
         let verdict = match fast {
             true => InitialDecision::Retry,
             false => InitialDecision::Proceed,
         };
         let policy = Policy::new(verdict);
         let mut config = keyed_server_config();
+        if mac {
+            authenticate_tokens(&mut config);
+        }
         config.initial_filter(policy.clone());
         let mut pair = Pair::new(Default::default(), config);
         if !fast {
@@ -337,7 +352,8 @@ fn filtered_handshake_after_retry() {
         assert_eq!(
             checks,
             [(false, true), (true, false)],
-            "a valid Retry token validates the address and forbids another Retry (fast: {fast})"
+            "a valid Retry token validates the address and forbids another Retry \
+             (fast: {fast}, mac: {mac})"
         );
     }
 }
@@ -464,15 +480,16 @@ fn no_filter_validates_reserved_bits_before_consuming_token() {
 #[test]
 fn invalid_retry_tokens_only_reach_the_gate() {
     let addr: SocketAddr = "[::1]:4433".parse().unwrap();
+    let dst_cid = ConnectionId::new(&[1; 8]);
     for allow in [false, true] {
         let mut config = keyed_server_config();
         let now = config.time_source.now();
         let packets: Vec<_> = [
-            retry_token(&config, "[::1]:4434".parse().unwrap(), now),
-            retry_token(&config, addr, now - Duration::from_secs(3600)),
+            retry_token(&config, "[::1]:4434".parse().unwrap(), dst_cid, now),
+            retry_token(&config, addr, dst_cid, now - Duration::from_secs(3600)),
         ]
         .iter()
-        .map(|token| initial_packet(&config, ConnectionId::new(&[1; 8]), token))
+        .map(|token| initial_packet(&config, dst_cid, token))
         .collect();
         let counts = instrument(&mut config);
         let policy = Policy::new(InitialDecision::Retry);
@@ -638,4 +655,102 @@ fn coalesced_initials_draw_one_retry() {
     assert!(is_retry(&out), "expected a Retry");
     assert_eq!(policy.gate_calls.load(Ordering::Relaxed), 1);
     assert_eq!(policy.seen().len(), 1);
+}
+
+/// With authenticated tokens, forged and encrypted-only tokens fail the MAC before any AEAD or
+/// replay-log work
+#[test]
+fn authenticated_tokens_reject_forgeries_before_aead() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    let mut config = keyed_server_config();
+    let encrypted_only = validation_token(&config, addr);
+    authenticate_tokens(&mut config);
+    let valid = validation_token(&config, addr);
+    let mut forged_validation = valid.clone();
+    *forged_validation.last_mut().unwrap() ^= 1;
+    let mut forged_retry = retry_token(&config, addr, dst_cid, config.time_source.now());
+    *forged_retry.last_mut().unwrap() ^= 1;
+    let forged: Vec<_> = [encrypted_only, forged_validation, forged_retry, vec![7; 80]]
+        .iter()
+        .map(|token| initial_packet(&config, dst_cid, token))
+        .collect();
+    let valid = initial_packet(&config, dst_cid, &valid);
+    let counts = instrument(&mut config);
+    let policy = Policy::new(InitialDecision::Ignore);
+    config.initial_filter(policy.clone());
+    let mut endpoint = server_endpoint(config);
+    for data in forged {
+        endpoint.handle(Instant::now(), addr, None, None, data, &mut Vec::new());
+    }
+    assert_eq!(counts.values(), [0; 3]);
+    assert!(
+        policy
+            .seen()
+            .iter()
+            .all(|(_, token)| !token.remote_address_validated()),
+        "forged tokens must leave the peer unvalidated"
+    );
+    endpoint.handle(Instant::now(), addr, None, None, valid, &mut Vec::new());
+    assert_eq!(
+        counts.values(),
+        [0, 1, 1],
+        "a valid NEW_TOKEN is still decrypted and checked against the replay log"
+    );
+    assert!(policy.seen().last().unwrap().1.remote_address_validated());
+}
+
+#[test]
+fn authenticated_fast_retry_needs_no_token_aead() {
+    let addr = "[::1]:4433".parse().unwrap();
+    let mut config = keyed_server_config();
+    authenticate_tokens(&mut config);
+    let data = initial_packet(&config, ConnectionId::new(&[1; 8]), &[]);
+    let counts = instrument(&mut config);
+    config.initial_filter(Policy::new(InitialDecision::Retry));
+    let mut endpoint = server_endpoint(config);
+    for _ in 0..3 {
+        let mut out = Vec::new();
+        endpoint.handle(Instant::now(), addr, None, None, data.clone(), &mut out);
+        assert!(is_retry(&out), "expected a Retry");
+    }
+    // Initial keys only for the default `supports_version`
+    assert_eq!(counts.values(), [3, 0, 0]);
+}
+
+/// Authenticated Retry tokens that are expired or for another DCID skip `after_token_check` and
+/// draw INVALID_TOKEN, like encrypted ones, but cost no AEAD work
+#[test]
+fn authenticated_invalid_retry_tokens_skip_after_token_check() {
+    let addr: SocketAddr = "[::1]:4433".parse().unwrap();
+    let dst_cid = ConnectionId::new(&[1; 8]);
+    let mut config = keyed_server_config();
+    authenticate_tokens(&mut config);
+    let now = config.time_source.now();
+    let packets: Vec<_> = [
+        retry_token(&config, addr, dst_cid, now - Duration::from_secs(3600)),
+        retry_token(&config, addr, ConnectionId::new(&[3; 8]), now),
+    ]
+    .iter()
+    .map(|token| initial_packet(&config, dst_cid, token))
+    .collect();
+    let counts = instrument(&mut config);
+    let policy = Policy::new(InitialDecision::Retry);
+    config.initial_filter(policy.clone());
+    let mut endpoint = server_endpoint(config);
+    for data in packets {
+        let mut out = Vec::new();
+        let event = endpoint.handle(Instant::now(), addr, None, None, data, &mut out);
+        assert!(matches!(event, Some(DatagramEvent::Response(_))));
+        assert!(
+            !is_retry(&out),
+            "an invalid Retry token must not draw Retry"
+        );
+    }
+    assert!(policy.seen().is_empty());
+    assert_eq!(
+        counts.values(),
+        [2, 0, 0],
+        "Initial keys for the close only"
+    );
 }

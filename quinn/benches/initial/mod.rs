@@ -25,14 +25,24 @@ fn run(
     verdict: InitialDecision,
     token_len: usize,
     valid_return: bool,
+    mac: bool,
 ) {
     let super::Context {
         mut server_config,
         mut client_config,
     } = super::Context::new();
+    if mac {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]);
+        server_config.token_authentication_key(Some(Arc::new(key)));
+    }
     let store = Arc::new(proto::TokenMemoryCache::default());
     if token_len > 0 {
-        store.insert("localhost", vec![7; token_len].into());
+        let mut token = vec![7; token_len];
+        if mac {
+            // Version and Retry type bytes, so the bogus token reaches the MAC check
+            token[..2].copy_from_slice(&[1, 0]);
+        }
+        store.insert("localhost", token.into());
     }
     client_config.token_store(store);
     let mut now = Instant::now();
@@ -117,43 +127,38 @@ fn run(
         black_box(out);
     });
 }
-macro_rules! case {
-    ($name:ident,$filter:expr,$admit:expr,$verdict:ident,$len:expr,$valid:expr) => {
-        fn $name(b: &mut Bencher) {
-            run(b, $filter, $admit, InitialDecision::$verdict, $len, $valid);
-        }
+macro_rules! cases {
+    ($($name:ident: $filter:expr, $admit:expr, $verdict:ident, $len:expr, $valid:expr,
+       $mac:expr;)*) => {
+        $(fn $name(b: &mut Bencher) {
+            run(b, $filter, $admit, InitialDecision::$verdict, $len, $valid, $mac);
+        })*
+        benchmark_group!(benches, $($name),*);
     };
 }
-case!(fast_retry_manual_empty, false, true, Retry, 0, false);
-case!(fast_retry_empty, true, true, Retry, 0, false);
-case!(fast_retry_bogus, true, true, Retry, 80, false);
-case!(fast_retry_manual_bogus, false, true, Retry, 80, false);
-case!(fast_retry_ignore_bogus, true, true, Ignore, 80, false);
-case!(fast_retry_ignore_empty, true, true, Ignore, 0, false);
-case!(fast_retry_gate_empty, true, false, Retry, 0, false);
-case!(fast_retry_gate_bogus, true, false, Retry, 80, false);
-case!(fast_retry_gate_long_bogus, true, false, Retry, 1000, false);
-case!(fast_retry_gate_valid_return, true, false, Retry, 0, true);
-case!(fast_retry_valid_return, true, true, Retry, 0, true);
-case!(fast_retry_manual_valid_return, false, true, Retry, 0, true);
-case!(fast_retry_proceed, true, true, Proceed, 0, false);
-case!(fast_retry_manual_drop_empty, false, true, Ignore, 0, false);
-case!(fast_retry_manual_drop_bogus, false, true, Ignore, 80, false);
-benchmark_group!(
-    benches,
-    fast_retry_manual_empty,
-    fast_retry_empty,
-    fast_retry_bogus,
-    fast_retry_manual_bogus,
-    fast_retry_ignore_bogus,
-    fast_retry_ignore_empty,
-    fast_retry_gate_empty,
-    fast_retry_gate_bogus,
-    fast_retry_gate_long_bogus,
-    fast_retry_gate_valid_return,
-    fast_retry_valid_return,
-    fast_retry_manual_valid_return,
-    fast_retry_proceed,
-    fast_retry_manual_drop_empty,
-    fast_retry_manual_drop_bogus
-);
+cases! {
+    // name: filter, admit, verdict, token length, valid return, MAC tokens
+    fast_retry_manual_empty: false, true, Retry, 0, false, false;
+    fast_retry_empty: true, true, Retry, 0, false, false;
+    fast_retry_bogus: true, true, Retry, 80, false, false;
+    fast_retry_manual_bogus: false, true, Retry, 80, false, false;
+    fast_retry_ignore_bogus: true, true, Ignore, 80, false, false;
+    fast_retry_ignore_empty: true, true, Ignore, 0, false, false;
+    fast_retry_gate_empty: true, false, Retry, 0, false, false;
+    fast_retry_gate_bogus: true, false, Retry, 80, false, false;
+    fast_retry_gate_long_bogus: true, false, Retry, 1000, false, false;
+    fast_retry_gate_valid_return: true, false, Retry, 0, true, false;
+    fast_retry_valid_return: true, true, Retry, 0, true, false;
+    fast_retry_manual_valid_return: false, true, Retry, 0, true, false;
+    fast_retry_proceed: true, true, Proceed, 0, false, false;
+    fast_retry_manual_drop_empty: false, true, Ignore, 0, false, false;
+    fast_retry_manual_drop_bogus: false, true, Ignore, 80, false, false;
+    mac_fast_retry_manual_empty: false, true, Retry, 0, false, true;
+    mac_fast_retry_empty: true, true, Retry, 0, false, true;
+    mac_fast_retry_bogus: true, true, Retry, 72, false, true;
+    mac_fast_retry_manual_bogus: false, true, Retry, 72, false, true;
+    mac_fast_retry_ignore_bogus: true, true, Ignore, 72, false, true;
+    mac_fast_retry_manual_drop_bogus: false, true, Ignore, 72, false, true;
+    mac_fast_retry_valid_return: true, true, Retry, 0, true, true;
+    mac_fast_retry_manual_valid_return: false, true, Retry, 0, true, true;
+}

@@ -952,6 +952,7 @@ impl Endpoint {
         let payload = TokenPayload::Retry {
             address: addresses.remote,
             orig_dst_cid: dst_cid,
+            retry_src_cid: Some(loc_cid),
             issued: server_config.time_source.now(),
         };
         let token = server_config.token_codec.encode(payload, &mut self.rng);

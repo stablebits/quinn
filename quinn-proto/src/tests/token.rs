@@ -4,6 +4,7 @@ use std::io::Cursor;
 
 use super::*;
 use crate::packet::{FixedLengthConnectionIdParser, ProtectedHeader};
+use crate::token::{IncomingToken, TokenPayload};
 
 #[test]
 fn oversized_cached_initial_token() {
@@ -177,6 +178,98 @@ fn retry_token_expired() {
 
     assert_eq!(pair.client.known_connections(), 0);
     assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+/// `server_config()` with authenticated tokens enabled
+fn authenticated_server_config() -> ServerConfig {
+    let mut config = server_config();
+    config.token_authentication_key(Some(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &[42; 32]))));
+    config
+}
+
+/// An authenticated Retry token is bound to the address, the Retry's CID and its lifetime
+#[test]
+fn mac_retry_token_checks() {
+    let issued = UNIX_EPOCH + Duration::from_millis(42_950);
+    let clock = Arc::new(FakeTimeSource(Mutex::new(issued)));
+    let mut config = authenticated_server_config();
+    config
+        .time_source(clock.clone())
+        .retry_token_lifetime(Duration::from_millis(100));
+    let address: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let original = ConnectionId::new(&[1; 20]);
+    let retry = ConnectionId::new(&[2; 8]);
+    let token = config.token_codec.encode(
+        TokenPayload::Retry {
+            address,
+            orig_dst_cid: original,
+            retry_src_cid: Some(retry),
+            issued,
+        },
+        &mut rand::rng(),
+    );
+    let check = |dst_cid, address, token: &[u8]| {
+        IncomingToken::from_header(dst_cid, token, &config, address)
+    };
+
+    // Valid on every Initial of the attempt, not just one
+    for _ in 0..2 {
+        let validated = check(retry, address, &token).ok().unwrap();
+        assert!(validated.validated);
+        assert_eq!(validated.orig_dst_cid, original);
+        assert_eq!(validated.retry_src_cid, Some(retry));
+    }
+    assert!(check(original, address, &token).is_err(), "wrong DCID");
+    // Another address or a forged tag fails the MAC, which leaves the client unvalidated
+    let mut forged = token.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    for (address, token) in [
+        ("127.0.0.1:4434".parse().unwrap(), &token),
+        ("127.0.0.2:4433".parse().unwrap(), &token),
+        (address, &forged),
+    ] {
+        assert!(!check(retry, address, token).ok().unwrap().validated);
+    }
+    clock.advance(Duration::from_millis(100));
+    assert!(check(retry, address, &token).is_ok());
+    clock.advance(Duration::from_millis(1));
+    assert!(check(retry, address, &token).is_err(), "expired");
+    // A server sharing the key may issue with a slightly later clock
+    *clock.0.lock().unwrap() = issued - Duration::from_millis(1);
+    assert!(check(retry, address, &token).is_ok());
+}
+
+/// A Retry, its token's return and a NEW_TOKEN reconnection, with authenticated tokens
+#[test]
+fn authenticated_retry_then_use_token() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server
+        .set_server_config(Some(Arc::new(authenticated_server_config())));
+    let client_config = client_config();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        assert!(incoming.may_retry());
+        IncomingConnectionBehavior::Accept
+    });
+    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    pair.client
+        .connections
+        .get_mut(&client_ch_2)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
     assert_eq!(pair.server.known_connections(), 0);
     assert_eq!(pair.server.known_cids(), 0);
 }

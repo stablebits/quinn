@@ -131,9 +131,10 @@ re-enter the endpoint. Packets for existing connections never reach them.
   header or an invalid Retry token triggers an encrypted CONNECTION_CLOSE, which costs Initial keys
   and a response. The example drops malformed Initials outright.
 - `after_token_check` runs after the token check, so an `Ignore` there has already paid for it: a
-  key derivation and a decryption per token, forged or not. Peers with a valid token get their own
-  budget, so a retried client's return doesn't compete with new strangers. They still need one: a
-  Retry token can be reused within its lifetime.
+  key derivation and a decryption per token, forged or not. With
+  `ServerConfig::token_authentication_key` set, a forged token costs only a MAC check instead. Peers
+  with a valid token get their own budget, so a retried client's return doesn't compete with new
+  strangers. They still need one: a Retry token can be reused within its lifetime.
 
 On `Retry`, the endpoint answers right away, without creating an `Incoming` or deriving Initial
 keys. A custom crypto provider should override `crypto::ServerConfig::supports_version`, whose
