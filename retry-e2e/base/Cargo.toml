@@ -1,0 +1,32 @@
+[package]
+name = "retry-e2e-base"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not part of the quinn workspace
+[workspace]
+
+[[bin]]
+name = "retry_e2e"
+path = "../src/main.rs"
+
+
+[dependencies]
+# main@7616e6b2, the base of the fast Retry series
+quinn = { git = "https://github.com/quinn-rs/quinn", rev = "7616e6b2782722f3ce4a1b181ef08817d7f545e4", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+proto = { package = "quinn-proto", git = "https://github.com/quinn-rs/quinn", rev = "7616e6b2782722f3ce4a1b181ef08817d7f545e4", default-features = false, features = ["rustls-ring"] }
+bytes = "1"
+libc = "0.2"
+rcgen = "0.14"
+ring = "0.17"
+rustls = { version = "0.23.5", default-features = false, features = ["std", "ring"] }
+socket2 = ">=0.5, <0.7"
+tokio = { version = "1.28.1", features = ["rt-multi-thread", "time", "macros"] }
+
+# `filter` exists only in the v3 build
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("filter"))'] }
+
+[profile.release]
+debug = 1
