@@ -87,3 +87,22 @@ answered fraction. The sustained rate is the highest rate with `answered` ≥ 0.
   about 2.9 Gbit/s.
 - On the server, `nstat -az UdpRcvbufErrors UdpInErrors` shows datagrams dropped because the
   socket buffer was full, i.e. the server didn't keep up.
+
+### With alessandrod/recvmmsg-main
+
+Two more builds have Alessandro Decina's `recvmmsg-main` (`bf2b67f9`) merged in: `ar` (main +
+his branch, branch `ar-main`) and `ar-v3` (this series + his branch, branch `ar-fast-retry-v3`).
+His branch takes the receive syscalls out from under the endpoint lock and can run the endpoint
+driver on a runtime of its own, which `split` turns on:
+
+```sh
+(cd retry-e2e/ar && cargo build --release)
+(cd retry-e2e/ar-v3 && cargo build --release)
+retry-e2e/ar/target/release/retry_e2e server manual 1 0.0.0.0:4433          # main + his branch
+retry-e2e/ar/target/release/retry_e2e server manual 1 0.0.0.0:4433 split    # driver on its own thread
+retry-e2e/ar-v3/target/release/retry_e2e server fast 1 0.0.0.0:4433         # series + his branch
+retry-e2e/ar-v3/target/release/retry_e2e server fast 1 0.0.0.0:4433 split
+```
+
+With `split`, the driver gets a thread of its own besides the `<workers>` runtime threads, so
+compare `1 split` with `2` as well as with `1`. MAC tokens are not in these builds.

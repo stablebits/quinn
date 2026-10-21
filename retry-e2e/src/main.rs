@@ -8,14 +8,15 @@
 //!
 //! Modes: `manual` (the application calls `Incoming::retry()`), `fast` (an `InitialFilter`
 //! returns `Retry`), with `-mac` for authenticated tokens. Only `manual` exists without the
-//! `filter` feature, i.e. on the baseline.
+//! `filter` feature, i.e. on the baseline, and `-mac` needs the `mac` feature.
 //!
 //! Environment: `RETRY_E2E_N` requests per sample (default 32768), `RETRY_E2E_RCVBUF_KB` socket
 //! receive buffers (default 256), `RETRY_E2E_SERVER_WRAP` a command prefix for the server
 //! process, e.g. `taskset -c 2,3`.
 //!
-//! Two hosts: `retry_e2e server <mode> <workers> <bind address>` runs a server by itself and
-//! prints its CPU use every second. `retry_e2e flood <server address> <empty|bogus|bogus-mac>
+//! Two hosts: `retry_e2e server <mode> <workers> <bind address> [split]` runs a server by itself
+//! and prints its CPU use every second. `split` (builds with the `split` feature) runs the
+//! endpoint driver on a runtime of its own, on a separate thread. `retry_e2e flood <server address> <empty|bogus|bogus-mac>
 //! <rate in k/s>...` sends unique Initials at each rate for `RETRY_E2E_STEP_SECS` (default 5) from
 //! `RETRY_E2E_THREADS` sockets (default 4), and counts the Retries that come back.
 
@@ -46,6 +47,7 @@ fn main() {
             &args[2],
             args[3].parse().unwrap(),
             args.get(4).map_or("127.0.0.1:0", |a| a.as_str()),
+            args.get(5).is_some_and(|a| a == "split"),
         ),
         "client" => client(
             &args[2],
@@ -130,7 +132,7 @@ impl quinn::InitialFilter for RetryStrangers {
     }
 }
 
-fn server(mode: &str, workers: usize, bind: &str) {
+fn server(mode: &str, workers: usize, bind: &str, split: bool) {
     let standalone = std::env::var("RETRY_E2E_CERT").is_err();
     if standalone {
         generate_cert();
@@ -147,14 +149,18 @@ fn server(mode: &str, workers: usize, bind: &str) {
     match mode {
         "manual" => {}
         #[cfg(feature = "filter")]
-        "fast" | "fast-mac" => {
+        "fast" => {
             config.initial_filter(Arc::new(RetryStrangers));
         }
-        #[cfg(feature = "filter")]
+        #[cfg(feature = "mac")]
+        "fast-mac" => {
+            config.initial_filter(Arc::new(RetryStrangers));
+        }
+        #[cfg(feature = "mac")]
         "manual-mac" => {}
         _ => panic!("mode {mode} unsupported by this build"),
     }
-    #[cfg(feature = "filter")]
+    #[cfg(feature = "mac")]
     if mac(mode) {
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]);
         config.token_authentication_key(Some(Arc::new(key)));
@@ -162,7 +168,9 @@ fn server(mode: &str, workers: usize, bind: &str) {
     let sock = UdpSocket::bind(bind).unwrap();
     set_buffers(&sock);
     let addr = sock.local_addr().unwrap();
-    let endpoint = {
+    let endpoint = if split {
+        split_endpoint(&rt, config, sock)
+    } else {
         let _guard = rt.enter();
         quinn::Endpoint::new(
             Default::default(),
@@ -207,6 +215,35 @@ fn server(mode: &str, workers: usize, bind: &str) {
         }
         std::io::stdout().flush().unwrap();
     }
+}
+
+/// An endpoint whose driver runs on a runtime of its own, on a separate thread
+#[cfg(feature = "split")]
+fn split_endpoint(
+    rt: &tokio::runtime::Runtime,
+    config: quinn::ServerConfig,
+    sock: UdpSocket,
+) -> quinn::Endpoint {
+    let driver = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = driver.handle().clone();
+    thread::spawn(move || driver.block_on(std::future::pending::<()>()));
+    let runtimes = quinn::EndpointRuntimeConfig::new(
+        Arc::new(quinn::TokioRuntimeHandle::new(handle)),
+        Arc::new(quinn::TokioRuntimeHandle::new(rt.handle().clone())),
+    );
+    quinn::Endpoint::new_with_runtimes(Default::default(), Some(config), sock, runtimes).unwrap()
+}
+
+#[cfg(not(feature = "split"))]
+fn split_endpoint(
+    _: &tokio::runtime::Runtime,
+    _: quinn::ServerConfig,
+    _: UdpSocket,
+) -> quinn::Endpoint {
+    panic!("split needs a build with the `split` feature")
 }
 
 /// Client Initials with unique source CIDs, and those CIDs' indices

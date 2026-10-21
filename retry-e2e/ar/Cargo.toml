@@ -1,0 +1,35 @@
+[package]
+name = "retry-e2e-ar"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not part of the quinn workspace
+[workspace]
+
+[[bin]]
+name = "retry_e2e"
+path = "../src/main.rs"
+
+[features]
+default = ["split"]
+split = []
+
+[dependencies]
+# main@7616e6b2 with alessandrod/recvmmsg-main merged (branch ar-main)
+quinn = { git = "https://github.com/stablebits/quinn", rev = "0e6f39ded192726bf6b127351526e59a73c79cca", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+proto = { package = "quinn-proto", git = "https://github.com/stablebits/quinn", rev = "0e6f39ded192726bf6b127351526e59a73c79cca", default-features = false, features = ["rustls-ring"] }
+bytes = "1"
+libc = "0.2"
+rcgen = "0.14"
+ring = "0.17"
+rustls = { version = "0.23.5", default-features = false, features = ["std", "ring"] }
+socket2 = ">=0.5, <0.7"
+tokio = { version = "1.28.1", features = ["rt-multi-thread", "time", "macros"] }
+
+[profile.release]
+debug = 1
+
+# `filter` exists only in the series builds
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("filter", "mac"))'] }

@@ -12,7 +12,8 @@ name = "retry_e2e"
 path = "../src/main.rs"
 
 [features]
-filter = []
+filter = ["mac"]
+mac = []
 
 [dependencies]
 quinn = { path = "../../quinn", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -27,3 +28,7 @@ tokio = { version = "1.28.1", features = ["rt-multi-thread", "time", "macros"] }
 
 [profile.release]
 debug = 1
+
+# `split` exists only in the builds with alessandrod/recvmmsg-main
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("split"))'] }
