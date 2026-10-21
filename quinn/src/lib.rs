@@ -43,6 +43,7 @@ use std::pin::Pin;
 
 mod connection;
 mod endpoint;
+mod event_channel;
 mod incoming;
 mod mutex;
 mod recv_stream;
@@ -73,19 +74,19 @@ pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
-    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram,
+    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, ReadDatagrams,
     RemoteAddressWatcher, SendDatagram, SendDatagramError,
 };
-pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
+pub use crate::endpoint::{Accept, Endpoint, EndpointRuntimeConfig, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
 #[cfg(feature = "runtime-smol")]
 pub use crate::runtime::SmolRuntime;
-#[cfg(feature = "runtime-tokio")]
-pub use crate::runtime::TokioRuntime;
 #[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
 pub use crate::runtime::default_runtime;
-pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender};
+pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpSender, UdpSenderFactory};
+#[cfg(feature = "runtime-tokio")]
+pub use crate::runtime::{TokioRuntime, TokioRuntimeHandle};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};
 
 #[cfg(test)]

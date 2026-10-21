@@ -19,7 +19,9 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime as _, TokioRuntime, UdpSender};
+use crate::runtime::{
+    AsyncTimer, AsyncUdpSocket, Runtime as _, TokioRuntime, TokioRuntimeHandle, UdpSender,
+};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -43,7 +45,10 @@ use tracing::{error_span, info};
 use tracing_subscriber::EnvFilter;
 use udp::RecvMeta;
 
-use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
+use crate::{
+    ClientConfig, Endpoint, EndpointConfig, EndpointRuntimeConfig, RecvStream, SendStream,
+    TransportConfig,
+};
 
 #[test]
 fn handshake_timeout() {
@@ -1470,6 +1475,85 @@ async fn remote_address_monitoring() {
     client_conn.close(0u32.into(), b"done");
 }
 
+#[test]
+fn split_runtime_connect_and_rebind() {
+    let _guard = subscribe();
+
+    let io_runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let connection_runtime = Builder::new_current_thread().enable_time().build().unwrap();
+    let runtimes = EndpointRuntimeConfig::new(
+        Arc::new(TokioRuntimeHandle::new(io_runtime.handle().clone())),
+        Arc::new(TokioRuntimeHandle::new(connection_runtime.handle().clone())),
+    );
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let cert = CertificateDer::from(cert.cert);
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.clone()).unwrap();
+
+    let server_config =
+        crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+    let server = Endpoint::new_with_runtimes(
+        EndpointConfig::default(),
+        Some(server_config),
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+        runtimes.clone(),
+    )
+    .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = Endpoint::new_with_runtimes(
+        EndpointConfig::default(),
+        None,
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+        runtimes,
+    )
+    .unwrap();
+    client
+        .set_default_client_config(ClientConfig::with_root_certificates(Arc::new(roots)).unwrap());
+
+    const MSG: &[u8; 5] = b"hello";
+    connection_runtime.block_on(async move {
+        timeout(Duration::from_secs(5), async move {
+            let (accepted_send, accepted_recv) = tokio::sync::oneshot::channel();
+            let (write_send, write_recv) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let connection = server.accept().await.unwrap().await.unwrap();
+                accepted_send.send(()).unwrap();
+                write_recv.await.unwrap();
+                let mut stream = connection.open_uni().await.unwrap();
+                stream.write_all(MSG).await.unwrap();
+                stream.finish().unwrap();
+                _ = stream.stopped().await;
+            });
+
+            let connection = client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            accepted_recv.await.unwrap();
+            client
+                .rebind(
+                    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+                )
+                .unwrap();
+            write_send.send(()).unwrap();
+            let mut stream = connection.accept_uni().await.unwrap();
+            assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    });
+}
+
 #[tokio::test]
 async fn stream_id_flow_control() {
     let _guard = subscribe();
@@ -1538,6 +1622,58 @@ async fn two_datagram_readers() {
     );
     assert!(*a == *b"one" || *b == *b"one");
     assert!(*a == *b"two" || *b == *b"two");
+}
+
+#[tokio::test]
+async fn read_datagrams_empty_buffer_returns_immediately() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let _server = server.unwrap();
+
+    let mut datagrams: [Bytes; 0] = [];
+    assert_eq!(client.read_datagrams(&mut datagrams).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn read_datagrams_respects_buffer_capacity_and_drains_after_close() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+
+    let (client, server) = tokio::join!(
+        endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap(),
+        async { endpoint.accept().await.unwrap().await }
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    let payloads: [&'static [u8]; 3] = [b"one", b"two", b"three"];
+    for payload in payloads {
+        server.send_datagram(Bytes::from_static(payload)).unwrap();
+    }
+
+    let mut datagrams: [Bytes; 2] = std::array::from_fn(|_| Bytes::new());
+    assert_eq!(client.read_datagrams(&mut datagrams).await.unwrap(), 2);
+    assert_eq!(&datagrams[0][..], payloads[0]);
+    assert_eq!(&datagrams[1][..], payloads[1]);
+
+    client.close(0u32.into(), b"done");
+
+    let mut datagrams: [Bytes; 2] = std::array::from_fn(|_| Bytes::new());
+    assert_eq!(client.read_datagrams(&mut datagrams).await.unwrap(), 1);
+    assert_eq!(&datagrams[0][..], payloads[2]);
+
+    let error = client.read_datagrams(&mut datagrams).await.unwrap_err();
+    assert!(matches!(error, crate::ConnectionError::LocallyClosed));
 }
 
 #[tokio::test]

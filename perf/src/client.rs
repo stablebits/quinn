@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quinn::{crypto::rustls::QuicClientConfig, TokioRuntime};
+use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info};
@@ -19,7 +19,7 @@ use crate::{
     noprotection::NoProtectionClientConfig,
     parse_byte_size,
     stats::{OpenStreamStats, Stats},
-    CommonOpt, PERF_CIPHER_SUITES,
+    CommonOpt, RuntimeConfig, PERF_CIPHER_SUITES,
 };
 
 /// Connects to a QUIC perf server and maintains a specified pattern of requests until interrupted
@@ -68,7 +68,18 @@ pub struct Opt {
     common: CommonOpt,
 }
 
-pub async fn run(opt: Opt) -> Result<()> {
+impl Opt {
+    pub fn workers(&self) -> Option<usize> {
+        self.common.workers.map(|workers| workers.get())
+    }
+
+    #[cfg(feature = "split-runtimes")]
+    pub fn endpoint_workers(&self) -> Option<usize> {
+        self.common.endpoint_workers.map(|workers| workers.get())
+    }
+}
+
+pub async fn run(opt: Opt, runtimes: RuntimeConfig) -> Result<()> {
     let mut host_parts = opt.host.split(':');
     let host_name = host_parts.next().unwrap();
     let host_port = host_parts
@@ -102,7 +113,10 @@ pub async fn run(opt: Opt) -> Result<()> {
     let mut endpoint_cfg = quinn::EndpointConfig::default();
     endpoint_cfg.max_udp_payload_size(opt.common.max_udp_payload_size)?;
 
-    let endpoint = quinn::Endpoint::new(endpoint_cfg, None, socket, Arc::new(TokioRuntime))?;
+    #[cfg(not(feature = "split-runtimes"))]
+    let endpoint = quinn::Endpoint::new(endpoint_cfg, None, socket, runtimes)?;
+    #[cfg(feature = "split-runtimes")]
+    let endpoint = quinn::Endpoint::new_with_runtimes(endpoint_cfg, None, socket, runtimes)?;
 
     let default_provider = rustls::crypto::ring::default_provider();
     let provider = Arc::new(rustls::crypto::CryptoProvider {

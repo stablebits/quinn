@@ -10,7 +10,9 @@ use async_io::Async;
 use async_io::Timer;
 
 use super::AsyncTimer;
-use super::{AsyncUdpSocket, Runtime, UdpSender, UdpSenderHelper, UdpSenderHelperSocket};
+use super::{
+    AsyncUdpSocket, Runtime, UdpSender, UdpSenderFactory, UdpSenderHelper, UdpSenderHelperSocket,
+};
 
 /// A Quinn runtime for smol
 #[derive(Debug)]
@@ -67,12 +69,22 @@ impl UdpSenderHelperSocket for UdpSocket {
     }
 }
 
-impl AsyncUdpSocket for UdpSocket {
+impl UdpSenderFactory for UdpSocket {
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         Box::pin(UdpSenderHelper::new(self.clone(), |socket: &Self| {
             let socket = socket.clone();
             async move { socket.io.writable().await }
         }))
+    }
+}
+
+impl AsyncUdpSocket for UdpSocket {
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        UdpSenderFactory::create_sender(self)
+    }
+
+    fn sender_factory(&self) -> Option<Arc<dyn UdpSenderFactory>> {
+        Some(Arc::new(self.clone()))
     }
 
     fn poll_recv(
