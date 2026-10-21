@@ -19,12 +19,12 @@ use thiserror::Error;
 use tokio::sync::{
     Notify,
     futures::{Notified, OwnedNotified},
-    mpsc, oneshot, watch,
+    oneshot, watch,
 };
 use tracing::{Instrument, Span, debug_span};
 
 use crate::{
-    ConnectionEvent, Duration, Instant, VarInt,
+    ConnectionEvent, Duration, Instant, VarInt, event_channel,
     mutex::Mutex,
     recv_stream::RecvStream,
     runtime::{AsyncTimer, Runtime, UdpSender},
@@ -54,8 +54,8 @@ impl Connecting {
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        endpoint_events: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
+        conn_events: event_channel::Receiver<ConnectionEvent>,
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
@@ -68,14 +68,13 @@ impl Connecting {
                 endpoint_events,
                 conn_events,
                 on_handshake_data_send,
-                sender,
                 runtime.clone(),
             )),
             shared: Shared::default(),
         }));
         let connected = Box::pin(conn.shared.connected.clone().notified_owned());
 
-        let driver = ConnectionDriver::new(conn.clone());
+        let driver = ConnectionDriver::new(conn.clone(), sender);
         runtime.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
@@ -248,45 +247,50 @@ impl Future for Connecting {
 struct ConnectionDriver {
     conn: ConnectionRef,
     span: Span,
-}
-
-impl ConnectionDriver {
-    fn new(conn: ConnectionRef) -> Self {
-        let span = {
-            let conn = &mut conn.state.lock("poll");
-            debug_span!("drive", id = conn.handle.0)
-        };
-
-        Self { conn, span }
-    }
+    sender: Pin<Box<dyn UdpSender>>,
+    send_buffer: Vec<u8>,
+    /// We buffer a transmit when the underlying I/O would block
+    buffered_transmit: Option<proto::Transmit>,
 }
 
 impl Future for ConnectionDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let conn = &mut *self.conn.state.lock("poll");
-        let _guard = self.span.enter();
+        let this = self.get_mut();
+        let mut conn = this.conn.state.lock("poll");
 
-        if let Err(e) = conn.process_conn_events(&self.conn.shared, cx) {
-            conn.terminate(e, &self.conn.shared);
+        let span = this.span.clone();
+        let _guard = span.enter();
+
+        conn.driver = None;
+        conn.driver_woken = false;
+
+        if let Err(e) = conn.process_conn_events(&this.conn.shared, cx, &mut this.sender) {
+            conn.terminate(e, &this.conn.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx).inspect_err(|_| {
+        drop(conn);
+
+        let mut keep_going = this.drive_transmit(cx).inspect_err(|_| {
             // Transmit failed, so close the connection and clean state before returning the error.
+            let mut conn = this.conn.state.lock("poll");
             if !conn.inner.is_closed() {
-                conn.implicit_close(&self.conn.shared);
+                conn.implicit_close(&this.conn.shared);
             }
         })?;
+
+        let mut conn = this.conn.state.lock("poll");
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
         conn.forward_endpoint_events();
-        conn.forward_app_events(&self.conn.shared);
+        conn.forward_app_events(&this.conn.shared);
 
         if !conn.inner.is_drained() {
-            if keep_going {
+            if keep_going || conn.driver_woken {
                 // If the connection hasn't processed all tasks, schedule it again
+                conn.driver_woken = false;
                 cx.waker().wake_by_ref();
             } else {
                 match conn.driver.as_mut() {
@@ -300,6 +304,82 @@ impl Future for ConnectionDriver {
             unreachable!("drained connections always have an error");
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+impl ConnectionDriver {
+    fn new(conn: ConnectionRef, sender: Pin<Box<dyn UdpSender>>) -> Self {
+        let span = {
+            let conn = &mut conn.state.lock("poll");
+            debug_span!("drive", id = conn.handle.0)
+        };
+
+        Self {
+            conn,
+            span,
+            sender,
+            send_buffer: Vec::new(),
+            buffered_transmit: None,
+        }
+    }
+
+    fn drive_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let now = self.conn.state.lock("poll_transmit").runtime.now();
+        let mut transmits = 0;
+
+        let max_datagrams = self
+            .sender
+            .max_transmit_segments()
+            .min(MAX_TRANSMIT_SEGMENTS);
+
+        loop {
+            // Retry the last transmit, or get a new one.
+            let t = match self.buffered_transmit.take() {
+                Some(t) => t,
+                None => {
+                    let mut conn = self.conn.state.lock("poll_transmit");
+                    self.send_buffer.clear();
+                    self.send_buffer.reserve(conn.inner.current_mtu() as usize);
+                    match conn
+                        .inner
+                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
+                    {
+                        Some(t) => {
+                            transmits += match t.segment_size {
+                                None => 1,
+                                Some(s) => t.size.div_ceil(s), // round up
+                            };
+                            t
+                        }
+                        None => break,
+                    }
+                }
+            };
+
+            let len = t.size;
+            match self
+                .sender
+                .as_mut()
+                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
+            {
+                Poll::Pending => {
+                    self.buffered_transmit = Some(t);
+                    return Ok(false);
+                }
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Ok(())) => {}
+            }
+
+            if transmits >= MAX_TRANSMIT_DATAGRAMS {
+                // TODO: What isn't ideal here yet is that if we don't poll all
+                // datagrams that could be sent we don't go into the `app_limited`
+                // state and CWND continues to grow until we get here the next time.
+                // See https://github.com/quinn-rs/quinn/issues/1126
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 }
 
@@ -392,6 +472,24 @@ impl Connection {
     pub fn read_datagram(&self) -> ReadDatagram<'_> {
         ReadDatagram {
             conn: &self.0,
+            notify: self.0.shared.datagram_received.notified(),
+        }
+    }
+
+    /// Receive one or more application datagrams
+    ///
+    /// Fills `datagrams` with as many already-received datagrams as are available, up to the length
+    /// of `datagrams`. If none are buffered, waits for at least one datagram to arrive or for the
+    /// connection to close.
+    ///
+    /// Returns the number of entries written. If `datagrams` is empty, returns `Ok(0)` immediately.
+    /// If the connection is closed and no datagrams remain buffered, returns the connection error.
+    ///
+    /// This operation is cancel-safe.
+    pub fn read_datagrams<'a>(&'a self, datagrams: &'a mut [Bytes]) -> ReadDatagrams<'a> {
+        ReadDatagrams {
+            conn: &self.0,
+            datagrams,
             notify: self.0.shared.datagram_received.notified(),
         }
     }
@@ -953,6 +1051,54 @@ impl Future for ReadDatagram<'_> {
 }
 
 pin_project! {
+    /// Future produced by [`Connection::read_datagrams`]
+    pub struct ReadDatagrams<'a> {
+        conn: &'a ConnectionRef,
+        datagrams: &'a mut [Bytes],
+        #[pin]
+        notify: Notified<'a>,
+    }
+}
+
+impl Future for ReadDatagrams<'_> {
+    type Output = Result<usize, ConnectionError>;
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        let datagrams = &mut **this.datagrams;
+        if datagrams.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut state = this.conn.state.lock("ReadDatagrams::poll");
+        // Check for buffered datagrams before checking `state.error` so that already-received
+        // datagrams, which are necessarily finite, can be drained from a closed connection.
+        let mut count = 0;
+        while count < datagrams.len() {
+            let Some(datagram) = state.inner.datagrams().recv() else {
+                break;
+            };
+            datagrams[count] = datagram;
+            count += 1;
+        }
+        if count != 0 {
+            return Poll::Ready(Ok(count));
+        } else if let Some(ref e) = state.error {
+            return Poll::Ready(Err(e.clone()));
+        }
+        loop {
+            match this.notify.as_mut().poll(ctx) {
+                // `state` lock ensures we didn't race with readiness
+                Poll::Pending => return Poll::Pending,
+                // Spurious wakeup, get a new future
+                Poll::Ready(()) => this
+                    .notify
+                    .set(this.conn.shared.datagram_received.notified()),
+            }
+        }
+    }
+}
+
+pin_project! {
     /// Future produced by [`Connection::send_datagram_wait`]
     pub struct SendDatagram<'a> {
         conn: &'a ConnectionRef,
@@ -1086,36 +1232,32 @@ pub(crate) struct Shared {
 pub(crate) struct State {
     pub(crate) inner: proto::Connection,
     driver: Option<Waker>,
+    /// Set when the driver is woken while it is running outside the state lock.
+    driver_woken: bool,
     handle: ConnectionHandle,
     on_handshake_data: Option<oneshot::Sender<()>>,
     connected: bool,
     handshake_confirmed: bool,
     timer: Option<Pin<Box<dyn AsyncTimer>>>,
     timer_deadline: Option<Instant>,
-    conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    conn_events: event_channel::Receiver<ConnectionEvent>,
+    endpoint_events: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
     pub(crate) blocked_writers: FxHashMap<StreamId, Waker>,
     pub(crate) blocked_readers: FxHashMap<StreamId, Waker>,
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
-    sender: Pin<Box<dyn UdpSender>>,
     runtime: Arc<dyn Runtime>,
-    send_buffer: Vec<u8>,
-    /// We buffer a transmit when the underlying I/O would block
-    buffered_transmit: Option<proto::Transmit>,
     remote_address: watch::Sender<SocketAddr>,
 }
 
 impl State {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         inner: proto::Connection,
         handle: ConnectionHandle,
-        endpoint_events: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
+        endpoint_events: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
+        conn_events: event_channel::Receiver<ConnectionEvent>,
         on_handshake_data: oneshot::Sender<()>,
-        sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let remote_address = inner.remote_address();
@@ -1123,6 +1265,7 @@ impl State {
         Self {
             inner,
             driver: None,
+            driver_woken: false,
             handle,
             on_handshake_data: Some(on_handshake_data),
             connected: false,
@@ -1135,70 +1278,9 @@ impl State {
             blocked_readers: FxHashMap::default(),
             stopped: FxHashMap::default(),
             error: None,
-            sender,
             runtime,
-            send_buffer: Vec::new(),
-            buffered_transmit: None,
             remote_address: watch::Sender::new(remote_address),
         }
-    }
-
-    fn drive_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        let now = self.runtime.now();
-        let mut transmits = 0;
-
-        let max_datagrams = self
-            .sender
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
-
-        loop {
-            // Retry the last transmit, or get a new one.
-            let t = match self.buffered_transmit.take() {
-                Some(t) => t,
-                None => {
-                    self.send_buffer.clear();
-                    self.send_buffer.reserve(self.inner.current_mtu() as usize);
-                    match self
-                        .inner
-                        .poll_transmit(now, max_datagrams, &mut self.send_buffer)
-                    {
-                        Some(t) => {
-                            transmits += match t.segment_size {
-                                None => 1,
-                                Some(s) => t.size.div_ceil(s), // round up
-                            };
-                            t
-                        }
-                        None => break,
-                    }
-                }
-            };
-
-            let len = t.size;
-            match self
-                .sender
-                .as_mut()
-                .poll_send(&udp_transmit(&t, &self.send_buffer[..len]), cx)
-            {
-                Poll::Pending => {
-                    self.buffered_transmit = Some(t);
-                    return Ok(false);
-                }
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Ready(Ok(())) => {}
-            }
-
-            if transmits >= MAX_TRANSMIT_DATAGRAMS {
-                // TODO: What isn't ideal here yet is that if we don't poll all
-                // datagrams that could be sent we don't go into the `app_limited`
-                // state and CWND continues to grow until we get here the next time.
-                // See https://github.com/quinn-rs/quinn/issues/1126
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1213,11 +1295,12 @@ impl State {
         &mut self,
         shared: &Shared,
         cx: &mut Context<'_>,
+        sender: &mut Pin<Box<dyn UdpSender>>,
     ) -> Result<(), ConnectionError> {
         loop {
             match self.conn_events.poll_recv(cx) {
-                Poll::Ready(Some(ConnectionEvent::Rebind(sender))) => {
-                    self.sender = sender;
+                Poll::Ready(Some(ConnectionEvent::Rebind(new_sender))) => {
+                    *sender = new_sender;
                     self.inner.local_address_changed();
                 }
                 Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
@@ -1348,6 +1431,8 @@ impl State {
     pub(crate) fn wake(&mut self) {
         if let Some(x) = self.driver.take() {
             x.wake();
+        } else {
+            self.driver_woken = true;
         }
     }
 
@@ -1464,4 +1549,4 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// This can be lower than the maximum platform capabilities, to avoid excessive
 /// memory allocations when calling `poll_transmit()`. Benchmarks have shown
 /// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: usize = 10;
+const MAX_TRANSMIT_SEGMENTS: usize = 40;

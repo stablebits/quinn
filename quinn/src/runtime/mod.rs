@@ -1,11 +1,10 @@
-#[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
-use std::sync::Arc;
 use std::{
     fmt::{self, Debug},
     future::Future,
     io::{self, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{self, Context, Poll},
     time::Duration,
 };
@@ -54,6 +53,14 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// [`Waker`]: std::task::Waker
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>>;
 
+    /// Construct a shareable factory for senders associated with this socket.
+    ///
+    /// Implementations with cheaply cloneable socket handles should override this so new
+    /// connection senders can be created without borrowing the receive socket.
+    fn sender_factory(&self) -> Option<Arc<dyn UdpSenderFactory>> {
+        None
+    }
+
     /// Receive UDP datagrams, or register to be woken if receiving may succeed in the future
     fn poll_recv(
         &mut self,
@@ -77,6 +84,13 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     fn may_fragment(&self) -> bool {
         true
     }
+}
+
+/// Factory for constructing [`UdpSender`]s associated with a socket.
+pub trait UdpSenderFactory: Send + Sync + Debug + 'static {
+    /// Create a [`UdpSender`] that can register a single task for write-readiness notifications
+    /// and send a transmit, if ready.
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>>;
 }
 
 /// An object for asynchronously writing to an associated [`AsyncUdpSocket`].
@@ -280,7 +294,7 @@ pub fn default_runtime() -> Option<Arc<dyn Runtime>> {
 #[cfg(feature = "runtime-tokio")]
 mod tokio;
 #[cfg(feature = "runtime-tokio")]
-pub use tokio::TokioRuntime;
+pub use tokio::{TokioRuntime, TokioRuntimeHandle};
 
 #[cfg(feature = "runtime-smol")]
 mod smol;

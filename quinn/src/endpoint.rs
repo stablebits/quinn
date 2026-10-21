@@ -22,7 +22,7 @@ use std::{
 use crate::runtime::default_runtime;
 use crate::{
     Instant,
-    runtime::{AsyncUdpSocket, Runtime, UdpSender},
+    runtime::{AsyncUdpSocket, Runtime, UdpSender, UdpSenderFactory},
     udp_transmit,
 };
 use bytes::{Bytes, BytesMut};
@@ -38,13 +38,13 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{Notify, futures::Notified, mpsc};
+use tokio::sync::{Notify, futures::Notified};
 use tracing::{Instrument, Span};
 use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
-    connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
+    connection::Connecting, event_channel, incoming::Incoming, work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -56,7 +56,41 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub(crate) inner: EndpointRef,
+    endpoint_driver_runtime: Arc<dyn Runtime>,
     runtime: Arc<dyn Runtime>,
+}
+
+/// Runtime configuration for an [`Endpoint`].
+///
+/// Quinn uses an endpoint driver to receive UDP datagrams and route them to connections, and
+/// per-connection drivers for protocol timers, transmission, and application-facing state. Most
+/// applications should use [`EndpointRuntimeConfig::single`], but latency-sensitive applications can
+/// use [`EndpointRuntimeConfig::new`] to schedule the endpoint driver on a separate runtime.
+#[derive(Debug, Clone)]
+pub struct EndpointRuntimeConfig {
+    endpoint_driver: Arc<dyn Runtime>,
+    connection: Arc<dyn Runtime>,
+}
+
+impl EndpointRuntimeConfig {
+    /// Use `runtime` for both endpoint and connection drivers.
+    pub fn single(runtime: Arc<dyn Runtime>) -> Self {
+        Self {
+            endpoint_driver: runtime.clone(),
+            connection: runtime,
+        }
+    }
+
+    /// Use separate runtimes for the endpoint driver and connection drivers.
+    ///
+    /// `endpoint_driver` is used to wrap the UDP socket and schedule the endpoint driver. `connection`
+    /// is used to schedule per-connection drivers and timers.
+    pub fn new(endpoint_driver: Arc<dyn Runtime>, connection: Arc<dyn Runtime>) -> Self {
+        Self {
+            endpoint_driver,
+            connection,
+        }
+    }
 }
 
 impl Endpoint {
@@ -150,8 +184,24 @@ impl Endpoint {
         socket: std::net::UdpSocket,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
-        let socket = runtime.wrap_udp_socket(socket)?;
-        Self::new_with_abstract_socket(config, server_config, socket, runtime)
+        Self::new_with_runtimes(
+            config,
+            server_config,
+            socket,
+            EndpointRuntimeConfig::single(runtime),
+        )
+    }
+
+    /// Construct an endpoint with arbitrary configuration, socket, and runtime configuration
+    #[cfg(not(wasm_browser))]
+    pub fn new_with_runtimes(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: std::net::UdpSocket,
+        runtimes: EndpointRuntimeConfig,
+    ) -> io::Result<Self> {
+        let socket = runtimes.endpoint_driver.wrap_udp_socket(socket)?;
+        Self::new_with_abstract_socket_and_runtimes(config, server_config, socket, runtimes)
     }
 
     /// Construct an endpoint with arbitrary configuration and pre-constructed abstract socket
@@ -164,16 +214,39 @@ impl Endpoint {
         socket: Box<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
+        Self::new_with_abstract_socket_and_runtimes(
+            config,
+            server_config,
+            socket,
+            EndpointRuntimeConfig::single(runtime),
+        )
+    }
+
+    /// Construct an endpoint with arbitrary configuration, a pre-constructed abstract socket, and
+    /// runtime configuration.
+    ///
+    /// Useful when `socket` has additional state (e.g. sidechannels) attached for which shared
+    /// ownership is needed, and when the endpoint driver should be scheduled separately from
+    /// connection drivers.
+    pub fn new_with_abstract_socket_and_runtimes(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        socket: Box<dyn AsyncUdpSocket>,
+        runtimes: EndpointRuntimeConfig,
+    ) -> io::Result<Self> {
         let addr = socket.local_addr()?;
         let allow_mtud = !socket.may_fragment();
         let rc = EndpointRef::new(
             socket,
             proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new), allow_mtud),
             addr.is_ipv6(),
-            runtime.clone(),
+            runtimes.connection.clone(),
         );
-        let driver = EndpointDriver(rc.clone());
-        runtime.spawn(Box::pin(
+        let driver = EndpointDriver {
+            endpoint: rc.clone(),
+            runtime: runtimes.connection.clone(),
+        };
+        runtimes.endpoint_driver.spawn(Box::pin(
             async {
                 if let Err(e) = driver.await {
                     tracing::error!("I/O error: {}", e);
@@ -181,7 +254,11 @@ impl Endpoint {
             }
             .instrument(Span::current()),
         ));
-        Ok(Self { inner: rc, runtime })
+        Ok(Self {
+            inner: rc,
+            endpoint_driver_runtime: runtimes.endpoint_driver,
+            runtime: runtimes.connection,
+        })
     }
 
     /// Get the next incoming connection attempt from a client
@@ -238,28 +315,39 @@ impl Endpoint {
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
         let mut endpoint = self.inner.state.lock().unwrap();
-        if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
-            return Err(ConnectError::EndpointStopping);
+        if let Some(sender_factory) = endpoint.sender_factory.clone() {
+            return endpoint.connect(
+                self.runtime.now(),
+                config,
+                addr,
+                server_name,
+                || sender_factory.create_sender(),
+                self.runtime.clone(),
+            );
         }
-        if addr.is_ipv6() && !endpoint.ipv6 {
-            return Err(ConnectError::InvalidRemoteAddress(addr));
-        }
-        let addr = if endpoint.ipv6 {
-            SocketAddr::V6(ensure_ipv6(addr))
+        drop(endpoint);
+
+        let recv_io = self.inner.recv_io.lock().unwrap();
+        let mut endpoint = self.inner.state.lock().unwrap();
+        if let Some(sender_factory) = endpoint.sender_factory.clone() {
+            endpoint.connect(
+                self.runtime.now(),
+                config,
+                addr,
+                server_name,
+                || sender_factory.create_sender(),
+                self.runtime.clone(),
+            )
         } else {
-            addr
-        };
-
-        let (ch, conn) = endpoint
-            .inner
-            .connect(self.runtime.now(), config, addr, server_name)?;
-
-        let sender = endpoint.socket.create_sender();
-        endpoint.stats.outgoing_handshakes += 1;
-        Ok(endpoint
-            .recv_state
-            .connections
-            .insert(ch, conn, sender, false, self.runtime.clone()))
+            endpoint.connect(
+                self.runtime.now(),
+                config,
+                addr,
+                server_name,
+                || recv_io.socket.create_sender(),
+                self.runtime.clone(),
+            )
+        }
     }
 
     /// Switch to a new UDP socket
@@ -267,7 +355,7 @@ impl Endpoint {
     /// See [`Endpoint::rebind_abstract()`] for details.
     #[cfg(not(wasm_browser))]
     pub fn rebind(&self, socket: std::net::UdpSocket) -> io::Result<()> {
-        self.rebind_abstract(self.runtime.wrap_udp_socket(socket)?)
+        self.rebind_abstract(self.endpoint_driver_runtime.wrap_udp_socket(socket)?)
     }
 
     /// Switch to a new UDP socket
@@ -278,18 +366,28 @@ impl Endpoint {
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
         let addr = socket.local_addr()?;
-        let mut inner = self.inner.state.lock().unwrap();
-        inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
-        inner.sender = inner.socket.create_sender();
-        inner.ipv6 = addr.is_ipv6();
+        let sender_factory = socket.sender_factory();
+        let driver = {
+            let mut recv_io = self.inner.recv_io.lock().unwrap();
+            let mut inner = self.inner.state.lock().unwrap();
+            recv_io.prev_socket = Some(mem::replace(&mut recv_io.socket, socket));
+            inner.sender = recv_io.socket.create_sender();
+            inner.sender_factory = sender_factory;
+            inner.ipv6 = addr.is_ipv6();
 
-        // Update connection socket references
-        for sender in inner.recv_state.connections.senders.values() {
-            // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
-        }
-        if let Some(driver) = inner.driver.take() {
-            // Ensure the driver can register for wake-ups from the new socket
+            // Update connection socket references
+            for sender in inner.recv_state.connections.senders.values() {
+                // Ignoring errors from dropped connections
+                let new_sender = match &inner.sender_factory {
+                    Some(sender_factory) => sender_factory.create_sender(),
+                    None => recv_io.socket.create_sender(),
+                };
+                let _ = sender.send(ConnectionEvent::Rebind(new_sender));
+            }
+            inner.wake_driver()
+        };
+        if let Some(driver) = driver {
+            // Ensure the driver observes the new socket promptly.
             driver.wake();
         }
 
@@ -310,7 +408,7 @@ impl Endpoint {
 
     /// Get the local `SocketAddr` the underlying socket is bound to
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.state.lock().unwrap().socket.local_addr()
+        self.inner.recv_io.lock().unwrap().socket.local_addr()
     }
 
     /// Get the number of connections that are currently open
@@ -388,30 +486,36 @@ pub struct EndpointStats {
 /// an I/O error occurs.
 #[must_use = "endpoint drivers must be spawned for I/O to occur"]
 #[derive(Debug)]
-pub(crate) struct EndpointDriver(pub(crate) EndpointRef);
+pub(crate) struct EndpointDriver {
+    pub(crate) endpoint: EndpointRef,
+    runtime: Arc<dyn Runtime>,
+}
 
 impl Future for EndpointDriver {
     type Output = Result<(), io::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut endpoint = self.0.state.lock().unwrap();
-        match endpoint.driver.as_mut() {
-            Some(old_waker) => old_waker.clone_from(cx.waker()),
-            None => endpoint.driver = Some(cx.waker().clone()),
-        }
+        let this = self.get_mut();
 
-        let now = endpoint.runtime.now();
-        let mut keep_going = false;
-        keep_going |= endpoint.drive_recv(cx, now)?;
-        keep_going |= endpoint.handle_events(cx, &self.0.shared);
+        let now = this.runtime.now();
+        let mut keep_going = this.endpoint.drive_recv(cx, now, &*this.runtime)?;
+
+        let mut endpoint = this.endpoint.state.lock().unwrap();
+        keep_going |= endpoint.driver_woken;
+        endpoint.driver_woken = false;
+        keep_going |= endpoint.handle_events(cx, &this.endpoint.shared);
 
         if !endpoint.recv_state.incoming.is_empty() {
-            self.0.shared.incoming.notify_waiters();
+            this.endpoint.shared.incoming.notify_waiters();
         }
 
-        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
+        if this.endpoint.shared.ref_count.load(Ordering::Relaxed) == 0 && endpoint.is_idle() {
             Poll::Ready(Ok(()))
         } else {
+            match &mut endpoint.driver {
+                Some(driver) => driver.clone_from(cx.waker()),
+                None => endpoint.driver = Some(cx.waker().clone()),
+            }
             drop(endpoint);
             // If there is more work to do schedule the endpoint task again.
             // `wake_by_ref()` is called outside the lock to minimize
@@ -426,9 +530,9 @@ impl Future for EndpointDriver {
 
 impl Drop for EndpointDriver {
     fn drop(&mut self) {
-        let mut endpoint = self.0.state.lock().unwrap();
+        let mut endpoint = self.endpoint.state.lock().unwrap();
         endpoint.driver_lost = true;
-        self.0.shared.incoming.notify_waiters();
+        self.endpoint.shared.incoming.notify_waiters();
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
         endpoint.recv_state.connections.senders.clear();
@@ -436,13 +540,14 @@ impl Drop for EndpointDriver {
         // `idle` only re-reads that after being notified, and with the driver gone nothing else
         // can wake it. Same reason as the equivalent check in `EndpointInner::accept`.
         if endpoint.is_idle() {
-            self.0.shared.idle.notify_waiters();
+            self.endpoint.shared.idle.notify_waiters();
         }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct EndpointInner {
+    recv_io: Mutex<RecvIo>,
     pub(crate) state: Mutex<State>,
     pub(crate) shared: Shared,
 }
@@ -482,17 +587,25 @@ impl EndpointInner {
 
         // Phase 3: register the connection, or release the reservation, under the lock.
         let mut state = self.state.lock().unwrap();
+        let recv_io = if state.sender_factory.is_none() {
+            drop(state);
+            let recv_io = self.recv_io.lock().unwrap();
+            state = self.state.lock().unwrap();
+            Some(recv_io)
+        } else {
+            None
+        };
         state.pending_accepts -= 1;
         let result = match state.inner.finish_accept(accepted, &mut response_buffer) {
             Ok((handle, conn)) => {
-                state.stats.accepted_handshakes += 1;
-                let sender = state.socket.create_sender();
-                let runtime = state.runtime.clone();
-                let driver_lost = state.driver_lost;
-                Ok(state
-                    .recv_state
-                    .connections
-                    .insert(handle, conn, sender, driver_lost, runtime))
+                if let Some(sender_factory) = state.sender_factory.clone() {
+                    Ok(state.finish_accept(handle, conn, || sender_factory.create_sender()))
+                } else {
+                    let recv_io = recv_io
+                        .as_ref()
+                        .expect("socket locked without a sender factory");
+                    Ok(state.finish_accept(handle, conn, || recv_io.socket.create_sender()))
+                }
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -530,20 +643,122 @@ impl EndpointInner {
         state.stats.ignored_handshakes += 1;
         state.inner.ignore(incoming);
     }
+
+    fn drive_recv(
+        &self,
+        cx: &mut Context<'_>,
+        now: Instant,
+        runtime: &dyn Runtime,
+    ) -> Result<bool, io::Error> {
+        let mut recv_io = self.recv_io.lock().unwrap();
+        let get_time = || runtime.now();
+        recv_io.recv_limiter.start_cycle(get_time);
+
+        if let Some(mut socket) = recv_io.prev_socket.take() {
+            // We don't care about the `PollProgress` from old sockets.
+            let poll_res = {
+                let RecvIo {
+                    recv_buf,
+                    datagrams,
+                    recv_limiter,
+                    ..
+                } = &mut *recv_io;
+                poll_socket(
+                    self,
+                    cx,
+                    &mut *socket,
+                    recv_buf,
+                    datagrams,
+                    recv_limiter,
+                    runtime,
+                    now,
+                )
+            };
+            if poll_res.is_ok() {
+                recv_io.prev_socket = Some(socket);
+            }
+        };
+
+        let poll_res = {
+            let RecvIo {
+                socket,
+                recv_buf,
+                datagrams,
+                recv_limiter,
+                ..
+            } = &mut *recv_io;
+            poll_socket(
+                self,
+                cx,
+                &mut **socket,
+                recv_buf,
+                datagrams,
+                recv_limiter,
+                runtime,
+                now,
+            )
+        };
+        recv_io.recv_limiter.finish_cycle(get_time);
+
+        let poll_res = poll_res?;
+        if poll_res.received_connection_packet {
+            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
+            // one anymore. TODO: Account for multiple outgoing connections.
+            recv_io.prev_socket = None;
+        }
+        Ok(poll_res.keep_going)
+    }
+}
+
+struct RecvIo {
+    socket: Box<dyn AsyncUdpSocket>,
+    /// During an active migration, abandoned_socket receives traffic
+    /// until the first packet arrives on the new socket.
+    prev_socket: Option<Box<dyn AsyncUdpSocket>>,
+    recv_buf: Box<[u8]>,
+    /// Reused buffer that received datagrams are copied into and split into owned slices.
+    datagrams: BytesMut,
+    recv_limiter: WorkLimiter,
+}
+
+impl RecvIo {
+    fn new(socket: Box<dyn AsyncUdpSocket>, endpoint: &proto::Endpoint) -> Self {
+        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
+            as usize
+            * socket.max_receive_segments();
+        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
+        Self {
+            socket,
+            prev_socket: None,
+            recv_buf: recv_buf.into(),
+            datagrams: BytesMut::with_capacity(datagram_capacity),
+            recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
+        }
+    }
+}
+
+impl fmt::Debug for RecvIo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecvIo")
+            .field("socket", &self.socket)
+            .field("prev_socket", &self.prev_socket)
+            // recv_buf too large
+            .field("recv_limiter", &self.recv_limiter)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct State {
-    socket: Box<dyn AsyncUdpSocket>,
     sender: Pin<Box<dyn UdpSender>>,
-    /// During an active migration, abandoned_socket receives traffic
-    /// until the first packet arrives on the new socket.
-    prev_socket: Option<Box<dyn AsyncUdpSocket>>,
+    sender_factory: Option<Arc<dyn UdpSenderFactory>>,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
+    /// Set when the driver is woken while no driver waker is stored.
+    driver_woken: bool,
     ipv6: bool,
-    events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
+    events: event_channel::Receiver<(ConnectionHandle, EndpointEvent)>,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
@@ -561,39 +776,57 @@ pub(crate) struct Shared {
 }
 
 impl State {
-    fn drive_recv(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
-        let get_time = || self.runtime.now();
-        self.recv_state.recv_limiter.start_cycle(get_time);
-        if let Some(socket) = &mut self.prev_socket {
-            // We don't care about the `PollProgress` from old sockets.
-            let poll_res = self.recv_state.poll_socket(
-                cx,
-                &mut self.inner,
-                &mut **socket,
-                &mut self.sender,
-                &*self.runtime,
-                now,
-            );
-            if poll_res.is_err() {
-                self.prev_socket = None;
-            }
-        };
-        let poll_res = self.recv_state.poll_socket(
-            cx,
-            &mut self.inner,
-            &mut *self.socket,
-            &mut self.sender,
-            &*self.runtime,
-            now,
-        );
-        self.recv_state.recv_limiter.finish_cycle(get_time);
-        let poll_res = poll_res?;
-        if poll_res.received_connection_packet {
-            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
-            // one anymore. TODO: Account for multiple outgoing connections.
-            self.prev_socket = None;
+    fn finish_accept(
+        &mut self,
+        handle: ConnectionHandle,
+        conn: proto::Connection,
+        create_sender: impl FnOnce() -> Pin<Box<dyn UdpSender>>,
+    ) -> Connecting {
+        self.stats.accepted_handshakes += 1;
+        let sender = create_sender();
+        let runtime = self.runtime.clone();
+        self.recv_state
+            .connections
+            .insert(handle, conn, sender, self.driver_lost, runtime)
+    }
+
+    fn connect(
+        &mut self,
+        now: Instant,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+        create_sender: impl FnOnce() -> Pin<Box<dyn UdpSender>>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<Connecting, ConnectError> {
+        if self.driver_lost || self.recv_state.connections.close.is_some() {
+            return Err(ConnectError::EndpointStopping);
         }
-        Ok(poll_res.keep_going)
+        if addr.is_ipv6() && !self.ipv6 {
+            return Err(ConnectError::InvalidRemoteAddress(addr));
+        }
+        let addr = if self.ipv6 {
+            SocketAddr::V6(ensure_ipv6(addr))
+        } else {
+            addr
+        };
+
+        let (ch, conn) = self.inner.connect(now, config, addr, server_name)?;
+
+        self.stats.outgoing_handshakes += 1;
+        Ok(self
+            .recv_state
+            .connections
+            .insert(ch, conn, create_sender(), false, runtime))
+    }
+
+    fn wake_driver(&mut self) -> Option<Waker> {
+        if let Some(driver) = self.driver.take() {
+            Some(driver)
+        } else {
+            self.driver_woken = true;
+            None
+        }
     }
 
     fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
@@ -703,9 +936,9 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 #[derive(Debug)]
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    senders: FxHashMap<ConnectionHandle, event_channel::Sender<ConnectionEvent>>,
     /// Stored to give out clones to new ConnectionInners
-    sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
+    sender: event_channel::Sender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
     close: Option<(VarInt, Bytes)>,
 }
@@ -719,7 +952,7 @@ impl ConnectionSet {
         driver_lost: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Connecting {
-        let (send, recv) = mpsc::unbounded_channel();
+        let (send, recv) = event_channel::channel();
         if let Some((error_code, reason)) = &self.close {
             send.send(ConnectionEvent::Close {
                 error_code: *error_code,
@@ -799,23 +1032,26 @@ impl EndpointRef {
         ipv6: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
-        let (sender, events) = mpsc::unbounded_channel();
-        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
+        let (sender, events) = event_channel::channel();
+        let recv_state = RecvState::new(sender);
+        let sender_factory = socket.sender_factory();
         let sender = socket.create_sender();
+        let recv_io = RecvIo::new(socket, &inner);
         Self(Arc::new(EndpointInner {
             shared: Shared {
                 incoming: Notify::new(),
                 idle: Notify::new(),
                 ref_count: AtomicUsize::new(0),
             },
+            recv_io: Mutex::new(recv_io),
             state: Mutex::new(State {
-                socket,
                 sender,
-                prev_socket: None,
+                sender_factory,
                 inner,
                 ipv6,
                 events,
                 driver: None,
+                driver_woken: false,
                 driver_lost: false,
                 recv_state,
                 runtime,
@@ -840,10 +1076,10 @@ impl Drop for EndpointRef {
             return;
         }
 
-        let endpoint = &mut *self.0.state.lock().unwrap();
         // If the driver is about to be on its own, ensure it can shut down if the last
         // connection is gone.
-        if let Some(task) = endpoint.driver.take() {
+        let task = self.0.state.lock().unwrap().wake_driver();
+        if let Some(task) = task {
             task.wake();
         }
     }
@@ -860,22 +1096,15 @@ impl std::ops::Deref for EndpointRef {
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
-    recv_buf: Box<[u8]>,
-    /// Reused buffer that received datagrams are copied into and split into owned slices.
-    datagrams: BytesMut,
-    recv_limiter: WorkLimiter,
+}
+
+struct ReceivedDatagramBuffer {
+    meta: RecvMeta,
+    data: BytesMut,
 }
 
 impl RecvState {
-    fn new(
-        sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        max_receive_segments: usize,
-        endpoint: &proto::Endpoint,
-    ) -> Self {
-        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
-            as usize
-            * max_receive_segments;
-        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
+    fn new(sender: event_channel::Sender<(ConnectionHandle, EndpointEvent)>) -> Self {
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -883,119 +1112,127 @@ impl RecvState {
                 close: None,
             },
             incoming: VecDeque::new(),
-            recv_buf: recv_buf.into(),
-            datagrams: BytesMut::with_capacity(datagram_capacity),
-            recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
 
-    fn poll_socket(
+    fn handle_recv_batch(
         &mut self,
-        cx: &mut Context<'_>,
         endpoint: &mut proto::Endpoint,
-        socket: &mut dyn AsyncUdpSocket,
         sender: &mut Pin<Box<dyn UdpSender>>,
-        runtime: &dyn Runtime,
+        received: Vec<ReceivedDatagramBuffer>,
         now: Instant,
-    ) -> Result<PollProgress, io::Error> {
+    ) -> bool {
         let mut received_connection_packet = false;
-        let mut metas = [RecvMeta::default(); BATCH_SIZE];
-        let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
-            let mut bufs = self
-                .recv_buf
-                .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
-                .map(IoSliceMut::new);
-
-            // expect() safe as self.recv_buf is chunked into BATCH_SIZE items
-            // and iovs will be of size BATCH_SIZE, thus from_fn is called
-            // exactly BATCH_SIZE times.
-            std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
-        };
-        loop {
-            match socket.poll_recv(cx, &mut iovs, &mut metas) {
-                Poll::Ready(Ok(msgs)) => {
-                    self.recv_limiter.record_work(msgs);
-                    // Copy the received batch into `datagrams` and split each datagram off as
-                    // an owned slice. We can't read directly into `datagrams` and drop
-                    // `recv_buf`: once a slice has been handed to a connection the allocation
-                    // is shared, so the next `reserve` must allocate fresh backing memory.
-                    // Reading in place would therefore mean reserving the worst-case iovec
-                    // envelope before every poll and reallocating it whenever a prior datagram
-                    // is still in flight. `recv_buf` stays an allocate-once scratch buffer, and
-                    // we reserve only the bytes actually received.
-                    let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
-                    self.datagrams.reserve(batch_len);
-                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        self.datagrams.extend_from_slice(&buf[..meta.len]);
-                    }
-                    for meta in metas.iter().take(msgs) {
-                        let mut data = self.datagrams.split_to(meta.len);
-                        while !data.is_empty() {
-                            let buf = data.split_to(meta.stride.min(data.len()));
-                            let mut response_buffer = Vec::new();
-                            match endpoint.handle(
-                                now,
-                                meta.addr,
-                                meta.dst_ip,
-                                meta.ecn.map(proto_ecn),
-                                buf,
-                                &mut response_buffer,
-                            ) {
-                                Some(DatagramEvent::NewConnection(incoming)) => {
-                                    if self.connections.close.is_none() {
-                                        self.incoming.push_back(incoming);
-                                    } else {
-                                        let transmit =
-                                            endpoint.refuse(incoming, &mut response_buffer);
-                                        respond(transmit, &response_buffer, sender);
-                                    }
-                                }
-                                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                                    // Ignoring errors from dropped connections that haven't yet been cleaned up
-                                    received_connection_packet = true;
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
-                                }
-                                Some(DatagramEvent::Response(transmit)) => {
-                                    respond(transmit, &response_buffer, sender);
-                                }
-                                None => {}
-                            }
+        for ReceivedDatagramBuffer { meta, mut data } in received {
+            while !data.is_empty() {
+                let buf = data.split_to(meta.stride.min(data.len()));
+                let mut response_buffer = Vec::new();
+                match endpoint.handle(
+                    now,
+                    meta.addr,
+                    meta.dst_ip,
+                    meta.ecn.map(proto_ecn),
+                    buf,
+                    &mut response_buffer,
+                ) {
+                    Some(DatagramEvent::NewConnection(incoming)) => {
+                        if self.connections.close.is_none() {
+                            self.incoming.push_back(incoming);
+                        } else {
+                            let transmit = endpoint.refuse(incoming, &mut response_buffer);
+                            respond(transmit, &response_buffer, sender);
                         }
                     }
-                }
-                Poll::Pending => {
-                    return Ok(PollProgress {
-                        received_connection_packet,
-                        keep_going: false,
-                    });
-                }
-                // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
-                // attacker
-                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {
-                    continue;
-                }
-                // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
-                // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
-                // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
-                // it anyways.
-                Poll::Ready(Err(e)) if is_msg_size_err(&e) => {
-                    continue;
-                }
-                Poll::Ready(Err(e)) => {
-                    return Err(e);
+                    Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                        // Ignoring errors from dropped connections that haven't yet been cleaned up
+                        received_connection_packet = true;
+                        let _ = self
+                            .connections
+                            .senders
+                            .get_mut(&handle)
+                            .unwrap()
+                            .send(ConnectionEvent::Proto(event));
+                    }
+                    Some(DatagramEvent::Response(transmit)) => {
+                        respond(transmit, &response_buffer, sender);
+                    }
+                    None => {}
                 }
             }
-            if !self.recv_limiter.allow_work(|| runtime.now()) {
-                return Ok(PollProgress {
-                    received_connection_packet,
-                    keep_going: true,
-                });
+        }
+
+        received_connection_packet
+    }
+}
+
+fn poll_socket(
+    endpoint: &EndpointInner,
+    cx: &mut Context<'_>,
+    socket: &mut dyn AsyncUdpSocket,
+    recv_buf: &mut [u8],
+    datagrams: &mut BytesMut,
+    recv_limiter: &mut WorkLimiter,
+    runtime: &dyn Runtime,
+    now: Instant,
+) -> Result<PollProgress, io::Error> {
+    let mut progress = PollProgress::default();
+    let mut metas = [RecvMeta::default(); BATCH_SIZE];
+    let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
+        let mut bufs = recv_buf
+            .chunks_mut(recv_buf.len() / BATCH_SIZE)
+            .map(IoSliceMut::new);
+
+        // expect() safe as recv_buf is chunked into BATCH_SIZE items and iovs
+        // will be of size BATCH_SIZE, thus from_fn is called exactly
+        // BATCH_SIZE times.
+        std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
+    };
+    loop {
+        match socket.poll_recv(cx, &mut iovs, &mut metas) {
+            Poll::Ready(Ok(msgs)) => {
+                recv_limiter.record_work(msgs);
+                // Copy before acquiring endpoint state. A single backing buffer avoids one
+                // allocation per datagram while still yielding independently owned slices.
+                let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
+                datagrams.reserve(batch_len);
+                for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
+                    datagrams.extend_from_slice(&buf[..meta.len]);
+                }
+                let received = metas
+                    .iter()
+                    .copied()
+                    .take(msgs)
+                    .map(|meta| ReceivedDatagramBuffer {
+                        meta,
+                        data: datagrams.split_to(meta.len),
+                    })
+                    .collect();
+                let received_connection_packet = {
+                    let mut state = endpoint.state.lock().unwrap();
+                    let State {
+                        inner,
+                        recv_state,
+                        sender,
+                        ..
+                    } = &mut *state;
+                    recv_state.handle_recv_batch(inner, sender, received, now)
+                };
+                progress.received_connection_packet |= received_connection_packet;
             }
+            Poll::Pending => return Ok(progress),
+            // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
+            // attacker
+            Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+            // Ignore EMSGSIZE as we're currently not handling ICMPv4 Fragmentation Needed
+            // and ICMPv6 Packet Too Big (PTB) messages since they cannot be authenticated,
+            // and Datagram Packetization Layer Path MTU Discovery (DPLPMTUD) works without
+            // it anyways.
+            Poll::Ready(Err(ref e)) if is_msg_size_err(e) => continue,
+            Poll::Ready(Err(e)) => return Err(e),
+        }
+        if !recv_limiter.allow_work(|| runtime.now()) {
+            progress.keep_going = true;
+            return Ok(progress);
         }
     }
 }
@@ -1005,8 +1242,6 @@ impl fmt::Debug for RecvState {
         f.debug_struct("RecvState")
             .field("incoming", &self.incoming)
             .field("connections", &self.connections)
-            // recv_buf too large
-            .field("recv_limiter", &self.recv_limiter)
             .finish_non_exhaustive()
     }
 }
