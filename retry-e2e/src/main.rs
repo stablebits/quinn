@@ -13,13 +13,22 @@
 //! Environment: `RETRY_E2E_N` requests per sample (default 32768), `RETRY_E2E_RCVBUF_KB` socket
 //! receive buffers (default 256), `RETRY_E2E_SERVER_WRAP` a command prefix for the server
 //! process, e.g. `taskset -c 2,3`.
+//!
+//! Two hosts: `retry_e2e server <mode> <workers> <bind address>` runs a server by itself and
+//! prints its CPU use every second. `retry_e2e flood <server address> <empty|bogus|bogus-mac>
+//! <rate in k/s>...` sends unique Initials at each rate for `RETRY_E2E_STEP_SECS` (default 5) from
+//! `RETRY_E2E_THREADS` sockets (default 4), and counts the Retries that come back.
 
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
-    net::{SocketAddr, UdpSocket},
+    net::{SocketAddr, ToSocketAddrs, UdpSocket},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -27,17 +36,24 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 const CORPUS: usize = 2048;
 const SAMPLES: usize = 9;
+/// Unique Initials per flood, so a repeat never meets a still-queued `Incoming` with its CID
+const FLOOD_CORPUS: usize = 65536;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args[1].as_str() {
-        "server" => server(&args[2], args[3].parse().unwrap()),
+        "server" => server(
+            &args[2],
+            args[3].parse().unwrap(),
+            args.get(4).map_or("127.0.0.1:0", |a| a.as_str()),
+        ),
         "client" => client(
             &args[2],
             args[3].parse().unwrap(),
             &args[4],
             args[5].parse().unwrap(),
         ),
+        "flood" => flood(&args[2], &args[3], &args[4..]),
         other => panic!("unknown command {other}"),
     }
 }
@@ -90,7 +106,10 @@ fn set_buffers(sock: &UdpSocket) {
         actual /= 2;
     }
     if actual < kb << 10 {
-        eprintln!("WARN receive buffer capped at {} KiB, wanted {kb} KiB", actual >> 10);
+        eprintln!(
+            "WARN receive buffer capped at {} KiB, wanted {kb} KiB",
+            actual >> 10
+        );
     }
 }
 
@@ -111,7 +130,11 @@ impl quinn::InitialFilter for RetryStrangers {
     }
 }
 
-fn server(mode: &str, workers: usize) {
+fn server(mode: &str, workers: usize, bind: &str) {
+    let standalone = std::env::var("RETRY_E2E_CERT").is_err();
+    if standalone {
+        generate_cert();
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -136,7 +159,7 @@ fn server(mode: &str, workers: usize) {
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]);
         config.token_authentication_key(Some(Arc::new(key)));
     }
-    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let sock = UdpSocket::bind(bind).unwrap();
     set_buffers(&sock);
     let addr = sock.local_addr().unwrap();
     let endpoint = {
@@ -166,6 +189,17 @@ fn server(mode: &str, workers: usize) {
     });
     println!("READY {addr}");
     std::io::stdout().flush().unwrap();
+    if standalone {
+        // Started by hand: report CPU use until killed
+        let mut last = (Instant::now(), cpu_ns());
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            let now = (Instant::now(), cpu_ns());
+            let cores = (now.1 - last.1) as f64 / now.0.duration_since(last.0).as_nanos() as f64;
+            println!("CPU {:.0}% of a core", cores * 100.0);
+            last = now;
+        }
+    }
     for line in std::io::stdin().lock().lines() {
         match line.unwrap().as_str() {
             "CPU" => println!("CPU {}", cpu_ns()),
@@ -176,7 +210,12 @@ fn server(mode: &str, workers: usize) {
 }
 
 /// Client Initials with unique source CIDs, and those CIDs' indices
-fn corpus(mode: &str, kind: &str, addr: SocketAddr) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, usize>) {
+fn corpus(
+    mode: &str,
+    kind: &str,
+    addr: SocketAddr,
+    count: usize,
+) -> (Vec<Vec<u8>>, HashMap<Vec<u8>, usize>) {
     let (cert, _) = cert();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert).unwrap();
@@ -187,7 +226,7 @@ fn corpus(mode: &str, kind: &str, addr: SocketAddr) -> (Vec<Vec<u8>>, HashMap<Ve
     let now = Instant::now();
     let mut packets = Vec::new();
     let mut ids = HashMap::new();
-    for id in 0..CORPUS {
+    for id in 0..count {
         if kind == "bogus" {
             let mut token = vec![7; if mac(mode) { 72 } else { 80 }];
             if mac(mode) {
@@ -244,16 +283,19 @@ fn client(mode: &str, workers: usize, kind: &str, window: usize) {
         to_server.flush().unwrap();
         let mut line = String::new();
         from_server.read_line(&mut line).unwrap();
-        line.strip_prefix("CPU ").unwrap().trim().parse::<u64>().unwrap()
+        line.strip_prefix("CPU ")
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
     };
 
     smoke(addr);
-    let (packets, ids) = corpus(mode, kind, addr);
+    let (packets, ids) = corpus(mode, kind, addr, CORPUS);
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     set_buffers(&sock);
     sock.connect(addr).unwrap();
-    sock.set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut buf = [0; 2048];
     let mut wall = Vec::new();
     let mut cpu = Vec::new();
@@ -334,4 +376,118 @@ fn smoke(addr: SocketAddr) {
         conn.close(0u32.into(), b"smoke");
         client.wait_idle().await;
     });
+}
+
+/// Sends unique Initials at each rate and counts the Retries that come back
+fn flood(server: &str, kind: &str, rates: &[String]) {
+    let env = |name, default: usize| std::env::var(name).map_or(default, |v| v.parse().unwrap());
+    let threads = env("RETRY_E2E_THREADS", 4);
+    let secs = env("RETRY_E2E_STEP_SECS", 5) as u64;
+    let addr = server.to_socket_addrs().unwrap().next().unwrap();
+    // The certificate only matters for completing a handshake, which a flood never does
+    generate_cert();
+    let (mode, kind) = match kind.strip_suffix("-mac") {
+        Some(kind) => ("fast-mac", kind),
+        None => ("fast", kind),
+    };
+    let packets = Arc::new(corpus(mode, kind, addr, FLOOD_CORPUS).0);
+    for rate in rates {
+        let rate: f64 = rate.parse::<f64>().unwrap() * 1000.0;
+        let (sent, retries) = flood_step(addr, &packets, threads, rate, secs);
+        println!(
+            "RESULT kind={kind} mac={} rate_k={:.0} sent_k={:.1} retries_k={:.1} answered={:.3}",
+            mode == "fast-mac",
+            rate / 1e3,
+            sent / 1e3,
+            retries / 1e3,
+            retries / sent,
+        );
+    }
+}
+
+/// Sent and Retry rates over `secs`, after one second of warm-up
+fn flood_step(
+    addr: SocketAddr,
+    packets: &Arc<Vec<Vec<u8>>>,
+    threads: usize,
+    rate: f64,
+    secs: u64,
+) -> (f64, f64) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Instant::now();
+    let mut counters = Vec::new();
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let bind = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let sock = UdpSocket::bind(bind).unwrap();
+        set_buffers(&sock);
+        sock.connect(addr).unwrap();
+        let rx = sock.try_clone().unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (sent, received) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        counters.push((sent.clone(), received.clone()));
+
+        let stop_rx = stop.clone();
+        handles.push(thread::spawn(move || {
+            let mut buf = [0; 2048];
+            while !stop_rx.load(Ordering::Relaxed) {
+                if let Ok(len) = rx.recv(&mut buf) {
+                    if len > 0 && buf[0] & 0xf0 == 0xf0 {
+                        received.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+
+        let (stop, packets) = (stop.clone(), packets.clone());
+        let per_thread = rate / threads as f64;
+        handles.push(thread::spawn(move || {
+            // This thread's share of the corpus: t, t + threads, ...
+            let (mut n, mut i) = (0u64, t);
+            while !stop.load(Ordering::Relaxed) {
+                let due = (start.elapsed().as_secs_f64() * per_thread) as u64;
+                if n >= due {
+                    thread::sleep(Duration::from_micros(50));
+                    continue;
+                }
+                // Bounded, so a client that falls behind still sees `stop`
+                for _ in 0..(due - n).min(256) {
+                    // Send errors (e.g. ENOBUFS) just show up as a lower sent rate
+                    if sock.send(&packets[i]).is_ok() {
+                        sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    n += 1;
+                    i += threads;
+                    if i >= packets.len() {
+                        i = t;
+                    }
+                }
+            }
+        }));
+    }
+    let totals = || {
+        counters.iter().fold((0, 0), |(s, r), (sent, received)| {
+            (
+                s + sent.load(Ordering::Relaxed),
+                r + received.load(Ordering::Relaxed),
+            )
+        })
+    };
+    thread::sleep(Duration::from_secs(1));
+    let (t0, (s0, r0)) = (Instant::now(), totals());
+    thread::sleep(Duration::from_secs(secs));
+    let (t1, (s1, r1)) = (Instant::now(), totals());
+    stop.store(true, Ordering::Relaxed);
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    // Let the server drain before the next step
+    thread::sleep(Duration::from_secs(1));
+    let elapsed = t1.duration_since(t0).as_secs_f64();
+    ((s1 - s0) as f64 / elapsed, (r1 - r0) as f64 / elapsed)
 }
