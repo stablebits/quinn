@@ -22,7 +22,7 @@ use crate::{
     runtime::{AsyncUdpSocket, Runtime},
     udp_transmit,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use pin_project_lite::pin_project;
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent,
@@ -37,7 +37,8 @@ use udp::{BATCH_SIZE, RecvMeta};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
-    connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
+    connection::Connecting, incoming::Incoming, recv_buffer_pool::RecvBufferPool,
+    work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -790,7 +791,10 @@ impl std::ops::Deref for EndpointRef {
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
+    /// Scratch buffer the socket receives into
     recv_buf: Box<[u8]>,
+    /// Buffers that each received datagram is copied into before being handed out
+    recv_pool: RecvBufferPool,
     recv_limiter: WorkLimiter,
 }
 
@@ -800,12 +804,9 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments
-                * BATCH_SIZE
-        ];
+        let max_udp_payload_size =
+            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize;
+        let recv_buf = vec![0; max_udp_payload_size * max_receive_segments * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -814,6 +815,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            recv_pool: RecvBufferPool::new(max_udp_payload_size),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -844,9 +846,14 @@ impl RecvState {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
+                        let mut data = &buf[0..meta.len];
                         while !data.is_empty() {
-                            let buf = data.split_to(meta.stride.min(data.len()));
+                            // Copy each datagram, i.e. each GRO segment, into a small pooled
+                            // buffer, so that data retained downstream (e.g. unread stream data)
+                            // pins at most one datagram-sized buffer.
+                            let (datagram, rest) = data.split_at(meta.stride.min(data.len()));
+                            data = rest;
+                            let buf = self.recv_pool.copy_from_slice(datagram);
                             let mut response_buffer = Vec::new();
                             match endpoint.handle(
                                 now,
