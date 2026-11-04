@@ -47,6 +47,7 @@ mod connection;
 mod endpoint;
 mod incoming;
 mod mutex;
+mod recv_buffer_pool;
 mod recv_stream;
 mod runtime;
 mod send_stream;
