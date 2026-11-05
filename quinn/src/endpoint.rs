@@ -25,7 +25,7 @@ use crate::{
     runtime::{AsyncUdpSocket, Runtime, UdpSender},
     udp_transmit,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use pin_project_lite::pin_project;
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent,
@@ -44,7 +44,10 @@ use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
-    connection::Connecting, incoming::Incoming, work_limiter::WorkLimiter,
+    connection::Connecting,
+    incoming::Incoming,
+    recv_buffers::{RecvBuffers, SharedRecvBuffers},
+    work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -262,6 +265,14 @@ impl Endpoint {
             .recv_state
             .connections
             .insert(ch, conn, sender, false, self.runtime.clone()))
+    }
+
+    /// Replace the buffers that received datagrams are copied into
+    ///
+    /// See [`RecvBuffers`] for details. Datagrams received before this is called are copied using
+    /// the default implementation.
+    pub fn set_recv_buffers(&self, buffers: Box<dyn RecvBuffers>) {
+        self.inner.state.lock().unwrap().recv_state.buffers = buffers;
     }
 
     /// Switch to a new UDP socket
@@ -862,9 +873,10 @@ impl std::ops::Deref for EndpointRef {
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
+    /// Scratch buffer the socket receives into
     recv_buf: Box<[u8]>,
-    /// Reused buffer that received datagrams are copied into and split into owned slices.
-    datagrams: BytesMut,
+    /// Buffers that each received datagram is copied into before being processed
+    buffers: Box<dyn RecvBuffers>,
     recv_limiter: WorkLimiter,
 }
 
@@ -886,7 +898,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
-            datagrams: BytesMut::with_capacity(datagram_capacity),
+            buffers: Box::new(SharedRecvBuffers::new(datagram_capacity)),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -917,23 +929,17 @@ impl RecvState {
             match socket.poll_recv(cx, &mut iovs, &mut metas) {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
-                    // Copy the received batch into `datagrams` and split each datagram off as
-                    // an owned slice. We can't read directly into `datagrams` and drop
-                    // `recv_buf`: once a slice has been handed to a connection the allocation
-                    // is shared, so the next `reserve` must allocate fresh backing memory.
-                    // Reading in place would therefore mean reserving the worst-case iovec
-                    // envelope before every poll and reallocating it whenever a prior datagram
-                    // is still in flight. `recv_buf` stays an allocate-once scratch buffer, and
-                    // we reserve only the bytes actually received.
+                    // Copy each datagram (each GRO segment) out of the scratch buffer into an
+                    // owned buffer, see `RecvBuffers`
                     let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
-                    self.datagrams.reserve(batch_len);
+                    self.buffers.reserve(batch_len);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        self.datagrams.extend_from_slice(&buf[..meta.len]);
-                    }
-                    for meta in metas.iter().take(msgs) {
-                        let mut data = self.datagrams.split_to(meta.len);
+                        let mut data = &buf[..meta.len];
                         while !data.is_empty() {
-                            let buf = data.split_to(meta.stride.min(data.len()));
+                            let (datagram, rest) = data.split_at(meta.stride.min(data.len()));
+                            data = rest;
+                            let buf = self.buffers.copy_datagram(datagram);
+                            debug_assert_eq!(&buf[..], datagram);
                             let mut response_buffer = Vec::new();
                             match endpoint.handle(
                                 now,
