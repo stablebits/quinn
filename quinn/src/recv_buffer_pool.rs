@@ -1,4 +1,10 @@
 use bytes::BytesMut;
+use tracing::info;
+
+use crate::{Duration, Instant};
+
+/// How often pool statistics are logged
+const STATS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Largest buffer the pool hands out, so that one retained slice pins at most this many bytes
 ///
@@ -64,6 +70,25 @@ pub(crate) struct RecvBufferPool {
     live: usize,
     buffer_size: usize,
     max_buffers: usize,
+    stats: PoolStats,
+}
+
+/// Counters logged every [`STATS_INTERVAL`] while datagrams are received
+#[derive(Default)]
+struct PoolStats {
+    /// Datagrams copied
+    copies: u64,
+    /// Datagrams larger than the buffer size, copied into their own allocation
+    oversized: u64,
+    /// Datagrams copied into their own allocation because the pool was exhausted
+    exhausted: u64,
+    /// Buffers allocated
+    grown: u64,
+    /// Buffers released
+    shrunk: u64,
+    /// Largest number of allocated buffers
+    high_water: usize,
+    last_report: Option<Instant>,
 }
 
 impl RecvBufferPool {
@@ -84,12 +109,23 @@ impl RecvBufferPool {
             live: 0,
             buffer_size,
             max_buffers,
+            stats: PoolStats::default(),
         }
     }
 
     /// Copies `datagram` into a pooled buffer and returns it as an owned slice
     pub(crate) fn copy_from_slice(&mut self, datagram: &[u8]) -> BytesMut {
-        if datagram.len() > self.buffer_size || !self.prepare(datagram.len()) {
+        self.stats.copies += 1;
+        if self.stats.copies % 65_536 == 0 {
+            self.report_stats();
+        }
+
+        if datagram.len() > self.buffer_size {
+            self.stats.oversized += 1;
+            return BytesMut::from(datagram);
+        }
+        if !self.prepare(datagram.len()) {
+            self.stats.exhausted += 1;
             return BytesMut::from(datagram);
         }
 
@@ -155,6 +191,7 @@ impl RecvBufferPool {
                 self.slots[index] = None;
                 self.vacant.push(index);
                 self.live -= 1;
+                self.stats.shrunk += 1;
             }
         }
     }
@@ -204,7 +241,36 @@ impl RecvBufferPool {
         };
         self.live += 1;
         self.current = Some(index);
+        self.stats.grown += 1;
+        self.stats.high_water = self.stats.high_water.max(self.live);
         true
+    }
+
+    /// Logs the counters if [`STATS_INTERVAL`] has passed since the last report
+    fn report_stats(&mut self) {
+        let now = Instant::now();
+        if self
+            .stats
+            .last_report
+            .is_some_and(|last| now.duration_since(last) < STATS_INTERVAL)
+        {
+            return;
+        }
+        self.stats.last_report = Some(now);
+        let stats = &self.stats;
+        info!(
+            target: "quinn_recv_pool",
+            buffers = self.live,
+            buffer_bytes = self.live * self.buffer_size,
+            high_water = stats.high_water,
+            known_free = self.free.len(),
+            copies = stats.copies,
+            exhausted = stats.exhausted,
+            oversized = stats.oversized,
+            grown = stats.grown,
+            shrunk = stats.shrunk,
+            "receive buffer pool"
+        );
     }
 
     /// Number of allocated buffers
