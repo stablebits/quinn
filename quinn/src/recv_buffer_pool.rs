@@ -1,5 +1,7 @@
 use bytes::BytesMut;
 
+use crate::RecvBuffers;
+
 /// Largest buffer the pool hands out, so that one retained slice pins at most this many bytes
 ///
 /// Datagrams larger than the buffer size bypass the pool. With the default maximum UDP payload
@@ -23,7 +25,7 @@ const SWEEP_STEP: usize = 4;
 /// Buffers checked before the pool grows when no free buffer is known
 const MAX_SCAN: usize = 64;
 
-/// Recycles small buffers that received datagrams are copied into
+/// Default [`RecvBuffers`]: recycles small buffers that received datagrams are copied into
 ///
 /// Received datagrams are copied out of the socket's scratch buffer into pooled buffers and handed
 /// out as owned slices, one per datagram. Any slice that is still alive (for example stream data
@@ -71,17 +73,6 @@ impl RecvBufferPool {
             buffer_size,
             max_buffers,
         }
-    }
-
-    /// Copies `datagram` into a pooled buffer and returns it as an owned slice
-    pub(crate) fn copy_from_slice(&mut self, datagram: &[u8]) -> BytesMut {
-        if datagram.len() > self.buffer_size || !self.prepare(datagram.len()) {
-            return BytesMut::from(datagram);
-        }
-
-        let buffer = &mut self.buffers[self.current.expect("prepared above")];
-        buffer.extend_from_slice(datagram);
-        buffer.split_to(datagram.len())
     }
 
     /// Points `self.current` at a buffer that can take `len` more bytes
@@ -146,6 +137,18 @@ impl RecvBufferPool {
     }
 }
 
+impl RecvBuffers for RecvBufferPool {
+    fn copy_datagram(&mut self, datagram: &[u8]) -> BytesMut {
+        if datagram.len() > self.buffer_size || !self.prepare(datagram.len()) {
+            return BytesMut::from(datagram);
+        }
+
+        let buffer = &mut self.buffers[self.current.expect("prepared above")];
+        buffer.extend_from_slice(datagram);
+        buffer.split_to(datagram.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -159,11 +162,11 @@ mod tests {
     #[test]
     fn reuses_buffer_after_slices_are_dropped() {
         let mut pool = RecvBufferPool::with_limits(1500, 4);
-        let first = pool.copy_from_slice(&datagram(1, 1200));
+        let first = pool.copy_datagram(&datagram(1, 1200));
         let first_ptr = first.as_ptr();
         drop(first);
 
-        let second = pool.copy_from_slice(&datagram(2, 1200));
+        let second = pool.copy_datagram(&datagram(2, 1200));
         assert_eq!(second.as_ptr(), first_ptr);
         assert_eq!(&second[..], &datagram(2, 1200)[..]);
         assert_eq!(pool.buffers.len(), 1);
@@ -172,8 +175,8 @@ mod tests {
     #[test]
     fn packs_small_datagrams_into_current_buffer() {
         let mut pool = RecvBufferPool::with_limits(1500, 4);
-        let first = pool.copy_from_slice(&datagram(1, 100));
-        let second = pool.copy_from_slice(&datagram(2, 100));
+        let first = pool.copy_datagram(&datagram(1, 100));
+        let second = pool.copy_datagram(&datagram(2, 100));
 
         assert_eq!(second.as_ptr(), first.as_ptr().wrapping_add(100));
         assert_eq!(&first[..], &datagram(1, 100)[..]);
@@ -185,14 +188,14 @@ mod tests {
     fn reuses_released_buffer_among_referenced_ones() {
         let mut pool = RecvBufferPool::with_limits(1000, 64);
         let mut held = (0..20)
-            .map(|i| pool.copy_from_slice(&datagram(i, 1000)))
+            .map(|i| pool.copy_datagram(&datagram(i, 1000)))
             .collect::<Vec<_>>();
         let released = held.remove(10);
         let released_ptr = released.as_ptr();
         drop(released);
 
         // Every other buffer is still referenced, so the released one is reused
-        let reused = pool.copy_from_slice(&datagram(99, 1000));
+        let reused = pool.copy_datagram(&datagram(99, 1000));
         assert_eq!(reused.as_ptr(), released_ptr);
         assert_eq!(pool.buffers.len(), 20);
 
@@ -204,10 +207,10 @@ mod tests {
     #[test]
     fn falls_back_to_allocation_when_exhausted() {
         let mut pool = RecvBufferPool::with_limits(1000, 2);
-        let first = pool.copy_from_slice(&datagram(0, 1000));
-        let second = pool.copy_from_slice(&datagram(1, 1000));
+        let first = pool.copy_datagram(&datagram(0, 1000));
+        let second = pool.copy_datagram(&datagram(1, 1000));
 
-        let overflow = pool.copy_from_slice(&datagram(2, 1000));
+        let overflow = pool.copy_datagram(&datagram(2, 1000));
         assert_eq!(pool.buffers.len(), 2);
         assert_ne!(overflow.as_ptr(), first.as_ptr());
         assert_ne!(overflow.as_ptr(), second.as_ptr());
@@ -215,7 +218,7 @@ mod tests {
 
         let first_ptr = first.as_ptr();
         drop(first);
-        let reused = pool.copy_from_slice(&datagram(3, 1000));
+        let reused = pool.copy_datagram(&datagram(3, 1000));
         assert_eq!(reused.as_ptr(), first_ptr);
         assert_eq!(pool.buffers.len(), 2);
     }
@@ -223,7 +226,7 @@ mod tests {
     #[test]
     fn oversized_datagrams_bypass_pool() {
         let mut pool = RecvBufferPool::with_limits(1000, 2);
-        let large = pool.copy_from_slice(&datagram(1, 1500));
+        let large = pool.copy_datagram(&datagram(1, 1500));
         assert_eq!(&large[..], &datagram(1, 1500)[..]);
         assert!(pool.buffers.is_empty());
     }
@@ -231,10 +234,10 @@ mod tests {
     #[test]
     fn retained_slice_is_never_overwritten() {
         let mut pool = RecvBufferPool::with_limits(1000, 4);
-        let retained = pool.copy_from_slice(&datagram(7, 600));
+        let retained = pool.copy_datagram(&datagram(7, 600));
         for i in 0..100u8 {
             let len = 100 + usize::from(i) * 9;
-            let slice = pool.copy_from_slice(&datagram(i, len));
+            let slice = pool.copy_datagram(&datagram(i, len));
             assert_eq!(&slice[..], &datagram(i, len)[..]);
         }
         assert_eq!(&retained[..], &datagram(7, 600)[..]);
@@ -246,12 +249,12 @@ mod tests {
         let mut pool = RecvBufferPool::with_limits(100, 4096);
         // Long-held buffers, both in a long run and scattered between short-lived ones
         let mut held = (0..3 * MAX_SCAN)
-            .map(|i| pool.copy_from_slice(&datagram(i as u8, 100)))
+            .map(|i| pool.copy_datagram(&datagram(i as u8, 100)))
             .collect::<Vec<_>>();
         let mut in_flight = VecDeque::new();
         let mut cycle = |pool: &mut RecvBufferPool, iterations: usize, held: &mut Vec<BytesMut>| {
             for i in 0..iterations {
-                let slice = pool.copy_from_slice(&datagram(i as u8, 100));
+                let slice = pool.copy_datagram(&datagram(i as u8, 100));
                 if i % 97 == 0 && held.len() < 4 * MAX_SCAN {
                     held.push(slice.clone());
                 }

@@ -45,7 +45,7 @@ use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
     connection::Connecting, incoming::Incoming, recv_buffer_pool::RecvBufferPool,
-    work_limiter::WorkLimiter,
+    recv_buffers::RecvBuffers, work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -263,6 +263,14 @@ impl Endpoint {
             .recv_state
             .connections
             .insert(ch, conn, sender, false, self.runtime.clone()))
+    }
+
+    /// Replace the buffers that received datagrams are copied into
+    ///
+    /// See [`RecvBuffers`] for details. Datagrams received before this is called are copied into
+    /// the default pool.
+    pub fn set_recv_buffers(&self, buffers: Box<dyn RecvBuffers>) {
+        self.inner.state.lock().unwrap().recv_state.buffers = buffers;
     }
 
     /// Switch to a new UDP socket
@@ -866,7 +874,7 @@ struct RecvState {
     /// Scratch buffer the socket receives into
     recv_buf: Box<[u8]>,
     /// Buffers that each received datagram is copied into before being processed
-    recv_pool: RecvBufferPool,
+    buffers: Box<dyn RecvBuffers>,
     recv_limiter: WorkLimiter,
 }
 
@@ -887,7 +895,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
-            recv_pool: RecvBufferPool::new(max_udp_payload_size),
+            buffers: Box::new(RecvBufferPool::new(max_udp_payload_size)),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -927,7 +935,8 @@ impl RecvState {
                             // received along with it.
                             let (datagram, rest) = data.split_at(meta.stride.min(data.len()));
                             data = rest;
-                            let buf = self.recv_pool.copy_from_slice(datagram);
+                            let buf = self.buffers.copy_datagram(datagram);
+                            debug_assert_eq!(&buf[..], datagram);
                             let mut response_buffer = Vec::new();
                             match endpoint.handle(
                                 now,
