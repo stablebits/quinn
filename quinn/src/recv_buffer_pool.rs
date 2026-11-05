@@ -6,42 +6,62 @@ use bytes::BytesMut;
 /// size every datagram fits.
 const MAX_BUFFER_SIZE: usize = 2048;
 
-/// Upper bound on the number of pooled buffers
+/// Upper bound on the memory held by pooled buffers
 ///
 /// Once every pooled buffer is in use and the pool is at this size, datagrams fall back to
-/// individual allocations. The pool doesn't shrink, so this also bounds the memory it keeps
-/// after a burst.
-const MAX_BUFFERS: usize = 4096;
+/// individual allocations.
+const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
 
-/// Maximum number of buffers checked for reuse per datagram
-const MAX_PROBES: usize = 32;
+/// Number of buffers the pool keeps even when they are idle
+const MIN_BUFFERS: usize = 64;
+
+/// Below this many known-free buffers, the sweep checks [`SWEEP_STEP`] buffers per buffer change
+/// instead of one
+const SWEEP_LOW_WATER: usize = 64;
+
+/// Buffers checked per buffer change while few free buffers are known
+const SWEEP_STEP: usize = 4;
+
+/// Buffers checked before the pool grows when no free buffer is known
+const MAX_SCAN: usize = 64;
 
 /// Recycles small receive buffers so that each received datagram is backed by a buffer of at most
 /// one datagram's size
 ///
 /// Received datagrams are copied out of the socket's scratch buffer into pooled buffers and handed
 /// out as owned slices, one per datagram. Any slice that is still alive (for example stream data
-/// the application hasn't read yet) keeps its whole buffer allocated, so the buffer size bounds
-/// how much memory a single slice can retain.
+/// the application hasn't read yet, or data it kept after reading) keeps its whole buffer
+/// allocated, so the buffer size bounds how much memory a single slice can retain.
 ///
 /// A datagram that fits in the space left in the current buffer is copied right after the
 /// previous one, so several small datagrams can share a buffer, while a full-size datagram
-/// effectively takes a buffer of its own. Sharing never needs more buffers than giving each
-/// datagram its own: a retained slice still pins a single buffer, and the datagrams next to it use
-/// space that is pinned anyway.
+/// effectively takes a buffer of its own.
 ///
-/// Buffers are reused in ring order, which is also the order they were filled in, so the buffer
-/// after the current one is the one filled longest ago and usually no longer referenced. A buffer
-/// is reused once all slices taken from it have been dropped, which [`BytesMut::try_reclaim`]
-/// detects without allocating. Buffers that are still referenced keep their place in the ring and
-/// are skipped. After warming up, receiving therefore doesn't allocate.
+/// A buffer can be reused once all slices taken from it have been dropped, which
+/// [`BytesMut::try_reclaim`] detects without allocating. Such a buffer stays free until the pool
+/// hands it out again, since only the pool creates new slices of it. A sweep over the pooled
+/// buffers therefore moves free buffers to a free list, from which new datagrams take buffers
+/// regardless of how long other buffers stay in use. The sweep advances a little every time the
+/// current buffer is full, and faster while few free buffers are known.
+///
+/// The pool grows when no free buffer is found, up to [`MAX_POOL_BYTES`], and releases free
+/// buffers again while more than a quarter of them are known to be free, so that it doesn't keep
+/// the memory of a burst. After warming up, receiving therefore doesn't allocate.
 pub(crate) struct RecvBufferPool {
-    /// Pooled buffers, reused in ring order
-    buffers: Vec<BytesMut>,
-    /// Index of the buffer datagrams are currently copied into, if `buffers` isn't empty
-    current: usize,
-    /// Number of consecutive buffers found in use since a buffer was last reused or added
-    busy_streak: usize,
+    /// Pooled buffers; `None` marks a slot whose buffer was released when the pool shrank
+    slots: Vec<Option<BytesMut>>,
+    /// Whether each slot is in `free`
+    in_free: Vec<bool>,
+    /// Slots whose buffers are known to have no slices left
+    free: Vec<usize>,
+    /// Empty slots, reused when the pool grows
+    vacant: Vec<usize>,
+    /// Slot that datagrams are currently copied into
+    current: Option<usize>,
+    /// Next slot the sweep checks
+    cursor: usize,
+    /// Number of allocated buffers
+    live: usize,
     buffer_size: usize,
     max_buffers: usize,
 }
@@ -49,14 +69,19 @@ pub(crate) struct RecvBufferPool {
 impl RecvBufferPool {
     /// Creates a pool for datagrams of up to `max_datagram_size` bytes
     pub(crate) fn new(max_datagram_size: usize) -> Self {
-        Self::with_limits(max_datagram_size.min(MAX_BUFFER_SIZE), MAX_BUFFERS)
+        let buffer_size = max_datagram_size.min(MAX_BUFFER_SIZE);
+        Self::with_limits(buffer_size, MAX_POOL_BYTES / buffer_size.max(1))
     }
 
     fn with_limits(buffer_size: usize, max_buffers: usize) -> Self {
         Self {
-            buffers: Vec::new(),
-            current: 0,
-            busy_streak: 0,
+            slots: Vec::new(),
+            in_free: Vec::new(),
+            free: Vec::new(),
+            vacant: Vec::new(),
+            current: None,
+            cursor: 0,
+            live: 0,
             buffer_size,
             max_buffers,
         }
@@ -68,58 +93,131 @@ impl RecvBufferPool {
             return BytesMut::from(datagram);
         }
 
-        let buffer = &mut self.buffers[self.current];
+        let index = self.current.expect("prepared above");
+        let buffer = self.slots[index]
+            .as_mut()
+            .expect("current slot holds a buffer");
         buffer.extend_from_slice(datagram);
         buffer.split_to(datagram.len())
     }
 
     /// Points `self.current` at a buffer that can take `len` more bytes
     ///
-    /// Returns `false` if no such buffer was found and the pool shouldn't grow, in which case the
-    /// caller allocates instead.
+    /// Returns `false` if no free buffer was found and the pool is at its size limit, in which
+    /// case the caller allocates instead.
     fn prepare(&mut self, len: usize) -> bool {
-        let count = self.buffers.len();
-        // Keep packing into the current buffer, or rewind it if its slices have all been dropped
-        if count > 0 && self.buffers[self.current].try_reclaim(len) {
-            self.busy_streak = 0;
+        if let Some(index) = self.current {
+            let buffer = self.slots[index]
+                .as_ref()
+                .expect("current slot holds a buffer");
+            // Pack after the previous datagram
+            if buffer.capacity() - buffer.len() >= len {
+                return true;
+            }
+        }
+
+        self.maintain();
+
+        if let Some(index) = self.current {
+            let buffer = self.slots[index]
+                .as_mut()
+                .expect("current slot holds a buffer");
+            // Rewind the current buffer if its slices have all been dropped
+            if buffer.try_reclaim(len) {
+                return true;
+            }
+        }
+
+        if let Some(index) = self.take_free() {
+            self.current = Some(index);
             return true;
         }
 
-        for _ in 0..count.min(MAX_PROBES) {
-            self.current = (self.current + 1) % count;
-            if self.buffers[self.current].try_reclaim(len) {
-                self.busy_streak = 0;
-                return true;
-            }
-            self.busy_streak += 1;
+        self.sweep(MAX_SCAN);
+        if let Some(index) = self.take_free() {
+            self.current = Some(index);
+            return true;
         }
 
-        // Grow only once a full pass over the ring found every buffer in use. Until then, long
-        // runs of buffers held by unread data just cost this datagram its own allocation, and the
-        // next call resumes the pass where this one stopped.
-        if self.busy_streak < count || count == self.max_buffers {
+        self.grow()
+    }
+
+    /// Advances the sweep and releases a surplus free buffer, once per buffer change
+    fn maintain(&mut self) {
+        let step = match self.free.len() < SWEEP_LOW_WATER {
+            true => SWEEP_STEP,
+            false => 1,
+        };
+        self.sweep(step);
+
+        if self.live > MIN_BUFFERS && self.free.len() * 4 > self.live {
+            if let Some(index) = self.take_free() {
+                self.slots[index] = None;
+                self.vacant.push(index);
+                self.live -= 1;
+            }
+        }
+    }
+
+    /// Checks up to `budget` slots for buffers whose slices have all been dropped
+    fn sweep(&mut self, budget: usize) {
+        let count = self.slots.len();
+        for _ in 0..budget.min(count) {
+            let index = self.cursor;
+            self.cursor = (self.cursor + 1) % count;
+            if self.current == Some(index) || self.in_free[index] {
+                continue;
+            }
+            let Some(buffer) = self.slots[index].as_mut() else {
+                continue;
+            };
+            if buffer.try_reclaim(self.buffer_size) {
+                self.in_free[index] = true;
+                self.free.push(index);
+            }
+        }
+    }
+
+    fn take_free(&mut self) -> Option<usize> {
+        let index = self.free.pop()?;
+        self.in_free[index] = false;
+        Some(index)
+    }
+
+    /// Adds a buffer and makes it current, unless the pool is at its size limit
+    fn grow(&mut self) -> bool {
+        if self.live >= self.max_buffers {
             return false;
         }
 
-        // Grow geometrically so that a burst needs few full passes
-        let added = (count / 8).clamp(1, self.max_buffers - count);
-        let index = if count == 0 { 0 } else { self.current + 1 };
-        let new_buffers = (0..added).map(|_| BytesMut::with_capacity(self.buffer_size));
-        self.buffers.splice(index..index, new_buffers);
-        self.current = index;
-        self.busy_streak = 0;
+        let buffer = Some(BytesMut::with_capacity(self.buffer_size));
+        let index = match self.vacant.pop() {
+            Some(index) => {
+                self.slots[index] = buffer;
+                index
+            }
+            None => {
+                self.slots.push(buffer);
+                self.in_free.push(false);
+                self.slots.len() - 1
+            }
+        };
+        self.live += 1;
+        self.current = Some(index);
         true
     }
 
-    /// Number of pooled buffers
+    /// Number of allocated buffers
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.buffers.len()
+        self.live
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     fn datagram(byte: u8, len: usize) -> Vec<u8> {
@@ -152,22 +250,23 @@ mod tests {
     }
 
     #[test]
-    fn skips_buffers_that_are_still_referenced() {
-        let mut pool = RecvBufferPool::with_limits(1000, 8);
-        let kept_first = pool.copy_from_slice(&datagram(0, 1000));
-        let released = pool.copy_from_slice(&datagram(1, 1000));
-        let kept_last = pool.copy_from_slice(&datagram(2, 1000));
+    fn reuses_released_buffer_among_referenced_ones() {
+        let mut pool = RecvBufferPool::with_limits(1000, 64);
+        let mut held = (0..20)
+            .map(|i| pool.copy_from_slice(&datagram(i, 1000)))
+            .collect::<Vec<_>>();
+        let released = held.remove(10);
         let released_ptr = released.as_ptr();
         drop(released);
 
-        // The current and the oldest buffer are still referenced, so the middle one is reused
-        let reused = pool.copy_from_slice(&datagram(3, 1000));
+        // Every other buffer is still referenced, so the released one is reused
+        let reused = pool.copy_from_slice(&datagram(99, 1000));
         assert_eq!(reused.as_ptr(), released_ptr);
-        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.len(), 20);
 
-        assert_eq!(&kept_first[..], &datagram(0, 1000)[..]);
-        assert_eq!(&kept_last[..], &datagram(2, 1000)[..]);
-        assert_eq!(&reused[..], &datagram(3, 1000)[..]);
+        for (slice, i) in held.iter().zip((0..20u8).filter(|i| *i != 10)) {
+            assert_eq!(&slice[..], &datagram(i, 1000)[..]);
+        }
     }
 
     #[test]
@@ -212,39 +311,64 @@ mod tests {
 
     #[test]
     fn long_held_buffers_dont_grow_pool() {
-        let mut pool = RecvBufferPool::with_limits(100, 1024);
-        // A run of long-held buffers longer than a single call probes
-        let held = (0..3 * MAX_PROBES)
+        let mut pool = RecvBufferPool::with_limits(100, 4096);
+        // Long-held buffers, both in a long run and scattered between short-lived ones
+        let mut held = (0..3 * MAX_SCAN)
             .map(|i| pool.copy_from_slice(&datagram(i as u8, 100)))
             .collect::<Vec<_>>();
-
-        let mut in_flight = std::collections::VecDeque::new();
-        let mut cycle = |pool: &mut RecvBufferPool, iterations: usize| {
+        let mut in_flight = VecDeque::new();
+        let mut cycle = |pool: &mut RecvBufferPool, iterations: usize, held: &mut Vec<BytesMut>| {
             for i in 0..iterations {
-                in_flight.push_back(pool.copy_from_slice(&datagram(i as u8, 100)));
-                if in_flight.len() > 4 {
+                let slice = pool.copy_from_slice(&datagram(i as u8, 100));
+                if i % 97 == 0 && held.len() < 4 * MAX_SCAN {
+                    held.push(slice.clone());
+                }
+                in_flight.push_back(slice);
+                if in_flight.len() > 8 {
                     in_flight.pop_front();
                 }
             }
         };
 
-        cycle(&mut pool, 1_000);
+        cycle(&mut pool, 2_000, &mut held);
         let settled = pool.len();
-        assert!(settled <= held.len() * 9 / 8 + 8, "pool grew to {settled}");
-        cycle(&mut pool, 10_000);
-        assert_eq!(pool.len(), settled);
+        assert!(
+            settled <= held.len() + 2 * MIN_BUFFERS,
+            "pool grew to {settled}"
+        );
+        cycle(&mut pool, 20_000, &mut held);
+        assert!(
+            pool.len() <= settled,
+            "pool kept growing: {} > {settled}",
+            pool.len()
+        );
+    }
 
-        for (i, slice) in held.iter().enumerate() {
-            assert_eq!(&slice[..], &datagram(i as u8, 100)[..]);
+    #[test]
+    fn shrinks_after_burst() {
+        let mut pool = RecvBufferPool::with_limits(100, 4096);
+        let burst = (0..2_000)
+            .map(|i| pool.copy_from_slice(&datagram(i as u8, 100)))
+            .collect::<Vec<_>>();
+        assert_eq!(pool.len(), 2_000);
+        drop(burst);
+
+        for i in 0..20_000 {
+            drop(pool.copy_from_slice(&datagram(i as u8, 100)));
         }
+        assert!(
+            pool.len() <= 2 * MIN_BUFFERS,
+            "pool kept {} buffers",
+            pool.len()
+        );
     }
 
     #[test]
     fn default_limits() {
         let pool = RecvBufferPool::new(1472);
         assert_eq!(pool.buffer_size, 1472);
+        assert_eq!(pool.max_buffers, MAX_POOL_BYTES / 1472);
         let pool = RecvBufferPool::new(65527);
         assert_eq!(pool.buffer_size, MAX_BUFFER_SIZE);
-        assert_eq!(pool.max_buffers, MAX_BUFFERS);
     }
 }
