@@ -1,10 +1,18 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use bytes::BytesMut;
 use tracing::info;
 
 use crate::{Duration, Instant};
 
 /// How often pool statistics are logged
-const STATS_INTERVAL: Duration = Duration::from_secs(10);
+const STATS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Number of datagrams between checks whether [`STATS_INTERVAL`] has passed
+const STATS_CHECK_EVERY: u64 = 4096;
+
+/// Source of the numbers that tell pools of different endpoints apart in the logs
+static NEXT_POOL_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Largest buffer the pool hands out, so that one retained slice pins at most this many bytes
 ///
@@ -73,9 +81,12 @@ pub(crate) struct RecvBufferPool {
     stats: PoolStats,
 }
 
-/// Counters logged every [`STATS_INTERVAL`] while datagrams are received
+/// Counters logged every [`STATS_INTERVAL`] while datagrams are received, and when the pool is
+/// dropped
 #[derive(Default)]
 struct PoolStats {
+    /// Number identifying the pool in the logs
+    id: usize,
     /// Datagrams copied
     copies: u64,
     /// Datagrams larger than the buffer size, copied into their own allocation
@@ -109,15 +120,18 @@ impl RecvBufferPool {
             live: 0,
             buffer_size,
             max_buffers,
-            stats: PoolStats::default(),
+            stats: PoolStats {
+                id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+                ..PoolStats::default()
+            },
         }
     }
 
     /// Copies `datagram` into a pooled buffer and returns it as an owned slice
     pub(crate) fn copy_from_slice(&mut self, datagram: &[u8]) -> BytesMut {
         self.stats.copies += 1;
-        if self.stats.copies % 65_536 == 0 {
-            self.report_stats();
+        if self.stats.copies % STATS_CHECK_EVERY == 0 {
+            self.maybe_report_stats();
         }
 
         if datagram.len() > self.buffer_size {
@@ -247,7 +261,7 @@ impl RecvBufferPool {
     }
 
     /// Logs the counters if [`STATS_INTERVAL`] has passed since the last report
-    fn report_stats(&mut self) {
+    fn maybe_report_stats(&mut self) {
         let now = Instant::now();
         if self
             .stats
@@ -257,9 +271,14 @@ impl RecvBufferPool {
             return;
         }
         self.stats.last_report = Some(now);
+        self.report_stats("receive buffer pool");
+    }
+
+    fn report_stats(&self, message: &str) {
         let stats = &self.stats;
         info!(
             target: "quinn_recv_pool",
+            pool = stats.id,
             buffers = self.live,
             buffer_bytes = self.live * self.buffer_size,
             high_water = stats.high_water,
@@ -269,7 +288,7 @@ impl RecvBufferPool {
             oversized = stats.oversized,
             grown = stats.grown,
             shrunk = stats.shrunk,
-            "receive buffer pool"
+            "{message}"
         );
     }
 
@@ -277,6 +296,14 @@ impl RecvBufferPool {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.live
+    }
+}
+
+impl Drop for RecvBufferPool {
+    fn drop(&mut self) {
+        if self.stats.copies > 0 {
+            self.report_stats("receive buffer pool dropped");
+        }
     }
 }
 
