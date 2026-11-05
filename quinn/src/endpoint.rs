@@ -44,10 +44,8 @@ use udp::{BATCH_SIZE, RecvMeta, is_msg_size_err};
 
 use crate::{
     ConnectionEvent, EndpointConfig, IO_LOOP_BOUND, RECV_TIME_BOUND, VarInt,
-    connection::Connecting,
-    incoming::Incoming,
-    recv_buffers::{RecvBuffers, SharedRecvBuffers},
-    work_limiter::WorkLimiter,
+    connection::Connecting, incoming::Incoming, recv_buffer_pool::RecvBufferPool,
+    recv_buffers::RecvBuffers, work_limiter::WorkLimiter,
 };
 
 /// A QUIC endpoint.
@@ -269,8 +267,8 @@ impl Endpoint {
 
     /// Replace the buffers that received datagrams are copied into
     ///
-    /// See [`RecvBuffers`] for details. Datagrams received before this is called are copied using
-    /// the default implementation.
+    /// See [`RecvBuffers`] for details. Datagrams received before this is called are copied into
+    /// the default pool.
     pub fn set_recv_buffers(&self, buffers: Box<dyn RecvBuffers>) {
         self.inner.state.lock().unwrap().recv_state.buffers = buffers;
     }
@@ -886,10 +884,9 @@ impl RecvState {
         max_receive_segments: usize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let datagram_capacity = endpoint.config().get_max_udp_payload_size().min(64 * 1024)
-            as usize
-            * max_receive_segments;
-        let recv_buf = vec![0; datagram_capacity * BATCH_SIZE];
+        let max_udp_payload_size =
+            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize;
+        let recv_buf = vec![0; max_udp_payload_size * max_receive_segments * BATCH_SIZE];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -898,7 +895,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
-            buffers: Box::new(SharedRecvBuffers::new(datagram_capacity)),
+            buffers: Box::new(RecvBufferPool::new(max_udp_payload_size)),
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
@@ -930,7 +927,8 @@ impl RecvState {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
                     // Copy each datagram (each GRO segment) out of the scratch buffer into an
-                    // owned buffer, see `RecvBuffers`
+                    // owned buffer, see `RecvBuffers`. With the default pool, data retained
+                    // downstream keeps at most one datagram-sized buffer allocated.
                     let batch_len = metas.iter().take(msgs).map(|meta| meta.len).sum();
                     self.buffers.reserve(batch_len);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
